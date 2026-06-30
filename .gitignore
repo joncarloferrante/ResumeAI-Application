@@ -1,0 +1,20 @@
+# Python
+backend/venv/
+backend/__pycache__/
+*.pyc
+
+# Node
+frontend/node_modules/
+frontend/dist/
+
+# Logs
+*.log
+
+# Uploaded resumes
+uploads/
+
+# VS Code
+.vscode/
+
+# Environment variables
+.env
