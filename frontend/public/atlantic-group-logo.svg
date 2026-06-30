@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 300 120" role="img" aria-labelledby="title">
+  <title id="title">Atlantic Group</title>
+  <rect width="300" height="120" fill="#ffffff"/>
+  <g fill="none" stroke="#111827" stroke-width="3" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M141 70c8-18 10-35 9-53"/>
+    <path d="M159 70c-8-18-10-35-9-53"/>
+    <path d="M124 72c18 4 34 4 52 0"/>
+    <path d="M112 34h26"/>
+    <path d="M162 34h26"/>
+    <path d="M119 25l18 5"/>
+    <path d="M181 25l-18 5"/>
+  </g>
+  <g fill="#dc2626" stroke="#dc2626" stroke-width="1.5">
+    <path d="M150 18l13 8h-26z" fill="none"/>
+    <rect x="139" y="28" width="22" height="12" rx="1" fill="none"/>
+    <path d="M145 28v12M150 28v12M155 28v12"/>
+    <path d="M137 43h26"/>
+  </g>
+  <text x="150" y="98" text-anchor="middle" fill="#111827" font-family="Georgia, 'Times New Roman', serif" font-size="26" letter-spacing="1.5">
+    ATLANTIC GROUP
+  </text>
+</svg>

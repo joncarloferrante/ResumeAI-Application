@@ -12,11 +12,13 @@ import time
 from auth_utils import hash_password, verify_password
 from resume_parser import parse_resume_file
 from database import (
-    create_audit_log_if_available,
+    create_audit_log,
     create_user,
     delete_candidate,
     find_duplicate_candidate,
+    get_audit_logs,
     get_candidate_by_id,
+    get_dashboard_analytics,
     get_user_by_email,
     get_user_by_id,
     init_db,
@@ -69,7 +71,7 @@ def public_user(user: dict) -> dict:
     return {
         "id": user["id"],
         "email": user["email"],
-        "role": user.get("role", "user"),
+        "role": user.get("role", "recruiter"),
         "created_at": user.get("created_at"),
     }
 
@@ -191,15 +193,28 @@ def log_parsed_resume_debug(filename: str, parsed_data: dict) -> None:
 
 
 def get_current_user(resumeai_session: str | None = Cookie(default=None, alias=SESSION_COOKIE_NAME)):
-    payload = read_signed_payload(resumeai_session)
-    if not payload:
-        raise HTTPException(status_code=401, detail="Not authenticated")
-
-    user = get_user_by_id(payload["user_id"])
+    user = get_user_from_session(resumeai_session)
     if not user:
         raise HTTPException(status_code=401, detail="Not authenticated")
 
     return user
+
+
+def get_user_from_session(resumeai_session: str | None):
+    payload = read_signed_payload(resumeai_session)
+    if not payload:
+        return None
+
+    user = get_user_by_id(payload["user_id"])
+
+    return user
+
+
+def require_admin(current_user: dict = Depends(get_current_user)):
+    if current_user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Admins only")
+
+    return current_user
 
 
 @app.get("/")
@@ -234,15 +249,24 @@ def login(credentials: AuthCredentials, response: Response):
     user = get_user_by_email(email)
 
     if not user or not verify_password(credentials.password, user["password_hash"]):
+        create_audit_log(email, "Login", "Invalid email or password.", "failed")
         raise HTTPException(status_code=401, detail="Invalid email or password.")
 
     set_session_cookie(response, user["id"])
+    create_audit_log(user["email"], "Login", "User signed in.", "success")
 
     return {"user": public_user(user)}
 
 
 @app.post("/auth/logout")
-def logout(response: Response):
+def logout(
+    response: Response,
+    resumeai_session: str | None = Cookie(default=None, alias=SESSION_COOKIE_NAME),
+):
+    user = get_user_from_session(resumeai_session)
+    if user:
+        create_audit_log(user["email"], "Logout", "User signed out.", "success")
+
     clear_session_cookie(response)
     return {"status": "logged_out"}
 
@@ -261,18 +285,43 @@ async def upload_resume(file: UploadFile = File(...), current_user: dict = Depen
 
     file_hash = calculate_file_hash(save_path)
     if find_duplicate_candidate(file.filename, "", file_hash):
+        create_audit_log(
+            current_user["email"],
+            "Resume Upload",
+            {"filename": file.filename, "reason": DUPLICATE_RESUME_MESSAGE},
+            "failed",
+        )
         raise HTTPException(status_code=409, detail=DUPLICATE_RESUME_MESSAGE)
 
     try:
         parsed_data = parse_resume_file(save_path)
     except Exception as exc:
+        create_audit_log(
+            current_user["email"],
+            "Resume Upload",
+            {"filename": file.filename, "reason": str(exc)},
+            "failed",
+        )
         raise HTTPException(status_code=400, detail=str(exc))
 
     log_parsed_resume_debug(file.filename, parsed_data)
 
     candidate_id = save_candidate(file.filename, parsed_data, file_hash)
     if candidate_id is None:
+        create_audit_log(
+            current_user["email"],
+            "Resume Upload",
+            {"filename": file.filename, "reason": DUPLICATE_RESUME_MESSAGE},
+            "failed",
+        )
         raise HTTPException(status_code=409, detail=DUPLICATE_RESUME_MESSAGE)
+
+    create_audit_log(
+        current_user["email"],
+        "Resume Upload",
+        {"candidate_id": candidate_id, "filename": file.filename},
+        "success",
+    )
 
     return {
         "filename": file.filename,
@@ -288,26 +337,70 @@ def list_candidates(current_user: dict = Depends(get_current_user)):
     return get_candidates()
 
 
+@app.get("/analytics")
+def analytics(current_user: dict = Depends(get_current_user)):
+    return get_dashboard_analytics()
+
+
+@app.get("/candidates/{candidate_id}")
+def view_candidate(candidate_id: int, current_user: dict = Depends(get_current_user)):
+    candidate = get_candidate_by_id(candidate_id)
+    if not candidate:
+        create_audit_log(
+            current_user["email"],
+            "Candidate View",
+            {"candidate_id": candidate_id, "reason": "Candidate not found"},
+            "failed",
+        )
+        raise HTTPException(status_code=404, detail="Candidate not found")
+
+    create_audit_log(
+        current_user["email"],
+        "Candidate View",
+        {
+            "candidate_id": candidate_id,
+            "candidate": candidate.get("candidate"),
+            "filename": candidate.get("filename"),
+        },
+        "success",
+    )
+
+    return candidate
+
+
 @app.delete("/candidates/{candidate_id}")
 def remove_candidate(candidate_id: int, current_user: dict = Depends(get_current_user)):
     # Role-based deletion is enforced on the server; hiding frontend controls is not enough.
     if current_user.get("role") != "admin":
+        create_audit_log(
+            current_user["email"],
+            "Candidate Delete",
+            {"candidate_id": candidate_id, "reason": "Admins only"},
+            "failed",
+        )
         raise HTTPException(status_code=403, detail="Admins only")
 
     candidate = get_candidate_by_id(candidate_id)
     if not candidate:
+        create_audit_log(
+            current_user["email"],
+            "Candidate Delete",
+            {"candidate_id": candidate_id, "reason": "Candidate not found"},
+            "failed",
+        )
         raise HTTPException(status_code=404, detail="Candidate not found")
 
     file_deleted = delete_uploaded_resume_file(candidate.get("filename"))
     delete_candidate(candidate_id)
-    create_audit_log_if_available(
-        current_user["id"],
-        "candidate_deleted",
+    create_audit_log(
+        current_user["email"],
+        "Candidate Delete",
         {
             "candidate_id": candidate_id,
             "filename": candidate.get("filename"),
             "file_deleted": file_deleted,
         },
+        "success",
     )
 
     return {
@@ -316,3 +409,18 @@ def remove_candidate(candidate_id: int, current_user: dict = Depends(get_current
         "candidate_id": candidate_id,
         "file_deleted": file_deleted,
     }
+
+
+@app.get("/audit-logs")
+def list_audit_logs(current_user: dict = Depends(get_current_user)):
+    if current_user.get("role") != "admin":
+        create_audit_log(
+            current_user["email"],
+            "Audit Logs View",
+            "Admins only",
+            "denied",
+        )
+        raise HTTPException(status_code=403, detail="Admins only")
+
+    create_audit_log(current_user["email"], "Audit Logs View", "Viewed audit logs.", "success")
+    return get_audit_logs()
