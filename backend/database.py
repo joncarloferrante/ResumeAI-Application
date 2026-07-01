@@ -1,4 +1,5 @@
 import json
+import re
 import sqlite3
 from collections import Counter
 from pathlib import Path
@@ -6,6 +7,31 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DB_PATH = PROJECT_ROOT / "database" / "resumeai.db"
 VALID_ROLES = {"admin", "recruiter"}
+
+
+def _normalize_username_base(value: str) -> str:
+    base_value = re.sub(r"[^a-z0-9]+", ".", value.lower().strip())
+    base_value = base_value.strip(".")
+    return base_value or "user"
+
+
+def _display_name_from_email(email: str) -> str:
+    local_part = email.split("@", 1)[0]
+    display_name = re.sub(r"[._-]+", " ", local_part).strip()
+    return display_name.title() or "New User"
+
+
+def _unique_username_from_email(email: str, used_usernames: set[str]) -> str:
+    base_username = _normalize_username_base(email.split("@", 1)[0])
+    candidate_username = base_username
+    suffix = 2
+
+    while candidate_username.lower() in used_usernames:
+        candidate_username = f"{base_username}{suffix}"
+        suffix += 1
+
+    used_usernames.add(candidate_username.lower())
+    return candidate_username
 
 
 def get_connection():
@@ -29,13 +55,49 @@ def init_db():
 
     cursor.execute("PRAGMA table_info(users)")
     user_columns = {row[1] for row in cursor.fetchall()}
+    if "name" not in user_columns:
+        cursor.execute("ALTER TABLE users ADD COLUMN name TEXT")
+    if "username" not in user_columns:
+        cursor.execute("ALTER TABLE users ADD COLUMN username TEXT")
     if "role" not in user_columns:
         cursor.execute("ALTER TABLE users ADD COLUMN role TEXT NOT NULL DEFAULT 'recruiter'")
+    if "is_locked" not in user_columns:
+        cursor.execute("ALTER TABLE users ADD COLUMN is_locked INTEGER NOT NULL DEFAULT 0")
+    if "last_login" not in user_columns:
+        cursor.execute("ALTER TABLE users ADD COLUMN last_login TIMESTAMP")
 
     cursor.execute("""
         UPDATE users
         SET role = 'recruiter'
         WHERE role IS NULL OR role NOT IN ('admin', 'recruiter')
+    """)
+
+    cursor.execute("""
+        SELECT id, email, name, username
+        FROM users
+        ORDER BY id
+    """)
+    existing_usernames: set[str] = set()
+    for row in cursor.fetchall():
+        normalized_username = str(row[3] or "").strip().lower()
+        desired_username = normalized_username or _unique_username_from_email(str(row[1] or ""), existing_usernames)
+        if normalized_username and normalized_username in existing_usernames:
+            desired_username = _unique_username_from_email(str(row[1] or ""), existing_usernames)
+        else:
+            existing_usernames.add(desired_username.lower())
+
+        desired_name = str(row[2] or "").strip() or _display_name_from_email(str(row[1] or ""))
+
+        if desired_name != row[2] or desired_username != row[3]:
+            cursor.execute("""
+                UPDATE users
+                SET name = ?, username = ?
+                WHERE id = ?
+            """, (desired_name, desired_username, row[0]))
+
+    cursor.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_users_username
+        ON users(username)
     """)
 
     cursor.execute("""
@@ -98,15 +160,33 @@ def validate_role(role: str) -> str:
     return normalized_role
 
 
-def create_user(email: str, password_hash: str, role: str = "recruiter") -> int:
+def create_user(
+    email: str,
+    password_hash: str,
+    role: str = "recruiter",
+    name: str | None = None,
+    username: str | None = None,
+) -> int:
     normalized_role = validate_role(role)
     conn = get_connection()
+    conn.row_factory = sqlite3.Row
     cursor = conn.cursor()
 
     cursor.execute("""
-        INSERT INTO users (email, password_hash, role)
-        VALUES (?, ?, ?)
-    """, (email, password_hash, normalized_role))
+        SELECT username
+        FROM users
+        WHERE username IS NOT NULL AND TRIM(username) != ''
+    """)
+    used_usernames = {str(row["username"]).strip().lower() for row in cursor.fetchall()}
+    generated_username = _unique_username_from_email(email, used_usernames)
+    generated_name = _display_name_from_email(email)
+    normalized_username = username.strip().lower() if username and username.strip() else generated_username
+    normalized_name = name.strip() if name and name.strip() else generated_name
+
+    cursor.execute("""
+        INSERT INTO users (name, username, email, password_hash, role, is_locked)
+        VALUES (?, ?, ?, ?, ?, 0)
+    """, (normalized_name, normalized_username, email, password_hash, normalized_role))
 
     user_id = cursor.lastrowid
     conn.commit()
@@ -130,13 +210,30 @@ def update_user_role(email: str, role: str) -> None:
     conn.close()
 
 
+def get_user_by_username(username: str):
+    conn = get_connection()
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        SELECT id, name, username, email, password_hash, role, is_locked, last_login, created_at
+        FROM users
+        WHERE LOWER(username) = LOWER(?)
+    """, (username,))
+
+    row = cursor.fetchone()
+    conn.close()
+
+    return dict(row) if row else None
+
+
 def get_user_by_email(email: str):
     conn = get_connection()
     conn.row_factory = sqlite3.Row
     cursor = conn.cursor()
 
     cursor.execute("""
-        SELECT id, email, password_hash, role, created_at
+        SELECT id, name, username, email, password_hash, role, is_locked, last_login, created_at
         FROM users
         WHERE email = ?
     """, (email,))
@@ -153,7 +250,7 @@ def get_user_by_id(user_id: int):
     cursor = conn.cursor()
 
     cursor.execute("""
-        SELECT id, email, role, created_at
+        SELECT id, name, username, email, role, is_locked, last_login, created_at
         FROM users
         WHERE id = ?
     """, (user_id,))
@@ -464,6 +561,238 @@ def get_candidate_by_id(candidate_id: int):
     conn.close()
 
     return dict(row) if row else None
+
+
+def get_users():
+    conn = get_connection()
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        SELECT id, name, username, email, role, is_locked, last_login, created_at
+        FROM users
+        ORDER BY
+            CASE role WHEN 'admin' THEN 0 ELSE 1 END,
+            id ASC
+    """)
+
+    rows = [dict(row) for row in cursor.fetchall()]
+    conn.close()
+
+    return rows
+
+
+def update_user(user_id: int, name: str, username: str, email: str, role: str) -> None:
+    normalized_role = validate_role(role)
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        UPDATE users
+        SET name = ?, username = ?, email = ?, role = ?
+        WHERE id = ?
+    """, (name.strip(), username.strip().lower(), email.strip().lower(), normalized_role, user_id))
+
+    conn.commit()
+    conn.close()
+
+
+def reset_user_password(user_id: int, password_hash: str) -> None:
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        UPDATE users
+        SET password_hash = ?
+        WHERE id = ?
+    """, (password_hash, user_id))
+
+    conn.commit()
+    conn.close()
+
+
+def set_user_lock_status(user_id: int, is_locked: bool) -> None:
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        UPDATE users
+        SET is_locked = ?
+        WHERE id = ?
+    """, (1 if is_locked else 0, user_id))
+
+    conn.commit()
+    conn.close()
+
+
+def mark_user_login(user_id: int) -> None:
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        UPDATE users
+        SET last_login = CURRENT_TIMESTAMP
+        WHERE id = ?
+    """, (user_id,))
+
+    conn.commit()
+    conn.close()
+
+
+def delete_user_record(user_id: int) -> bool:
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        DELETE FROM users
+        WHERE id = ?
+    """, (user_id,))
+
+    deleted = cursor.rowcount > 0
+    conn.commit()
+    conn.close()
+
+    return deleted
+
+
+def count_users_by_role(role: str) -> int:
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        SELECT COUNT(*)
+        FROM users
+        WHERE role = ?
+    """, (validate_role(role),))
+
+    row = cursor.fetchone()
+    conn.close()
+
+    return int(row[0] if row else 0)
+
+
+def count_locked_users() -> int:
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        SELECT COUNT(*)
+        FROM users
+        WHERE COALESCE(is_locked, 0) = 1
+    """)
+
+    row = cursor.fetchone()
+    conn.close()
+
+    return int(row[0] if row else 0)
+
+
+def count_total_users() -> int:
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("SELECT COUNT(*) FROM users")
+    row = cursor.fetchone()
+    conn.close()
+
+    return int(row[0] if row else 0)
+
+
+def count_audit_events_today() -> int:
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        SELECT COUNT(*)
+        FROM audit_logs
+        WHERE DATE(timestamp) = DATE('now')
+    """)
+
+    row = cursor.fetchone()
+    conn.close()
+
+    return int(row[0] if row else 0)
+
+
+def count_failed_login_attempts() -> int:
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        SELECT COUNT(*)
+        FROM audit_logs
+        WHERE action = 'Login' AND LOWER(status) = 'failed'
+    """)
+
+    row = cursor.fetchone()
+    conn.close()
+
+    return int(row[0] if row else 0)
+
+
+def get_security_dashboard_data(recent_limit: int = 20):
+    conn = get_connection()
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+
+    cursor.execute("SELECT COUNT(*) AS total_users FROM users")
+    total_users = cursor.fetchone()["total_users"]
+
+    cursor.execute("SELECT COUNT(*) AS admin_users FROM users WHERE role = 'admin'")
+    admin_users = cursor.fetchone()["admin_users"]
+
+    cursor.execute("SELECT COUNT(*) AS recruiter_users FROM users WHERE role = 'recruiter'")
+    recruiter_users = cursor.fetchone()["recruiter_users"]
+
+    cursor.execute("SELECT COUNT(*) AS locked_accounts FROM users WHERE COALESCE(is_locked, 0) = 1")
+    locked_accounts = cursor.fetchone()["locked_accounts"]
+
+    cursor.execute("SELECT COUNT(*) AS total_candidates FROM candidates")
+    total_candidates = cursor.fetchone()["total_candidates"]
+
+    cursor.execute("""
+        SELECT COUNT(*) AS total_resume_uploads
+        FROM audit_logs
+        WHERE action = 'Resume Upload' AND LOWER(status) = 'success'
+    """)
+    total_resume_uploads = cursor.fetchone()["total_resume_uploads"]
+
+    cursor.execute("""
+        SELECT COUNT(*) AS audit_events_today
+        FROM audit_logs
+        WHERE DATE(timestamp) = DATE('now')
+    """)
+    audit_events_today = cursor.fetchone()["audit_events_today"]
+
+    cursor.execute("""
+        SELECT COUNT(*) AS failed_login_attempts
+        FROM audit_logs
+        WHERE action = 'Login' AND LOWER(status) = 'failed'
+    """)
+    failed_login_attempts = cursor.fetchone()["failed_login_attempts"]
+
+    cursor.execute("""
+        SELECT id, timestamp, user_email, action, details, status
+        FROM audit_logs
+        ORDER BY id DESC
+        LIMIT ?
+    """, (recent_limit,))
+    recent_activity = [dict(row) for row in cursor.fetchall()]
+    conn.close()
+
+    return {
+        "summary": {
+            "total_users": int(total_users or 0),
+            "admin_users": int(admin_users or 0),
+            "recruiter_users": int(recruiter_users or 0),
+            "locked_accounts": int(locked_accounts or 0),
+            "total_candidates": int(total_candidates or 0),
+            "total_resume_uploads": int(total_resume_uploads or 0),
+            "audit_events_today": int(audit_events_today or 0),
+            "failed_login_attempts": int(failed_login_attempts or 0),
+        },
+        "recent_activity": recent_activity,
+    }
 
 
 def delete_candidate(candidate_id: int) -> bool:

@@ -15,15 +15,23 @@ from database import (
     create_audit_log,
     create_user,
     delete_candidate,
+    delete_user_record,
+    get_security_dashboard_data,
+    get_users,
     find_duplicate_candidate,
     get_audit_logs,
     get_candidate_by_id,
     get_dashboard_analytics,
     get_user_by_email,
     get_user_by_id,
+    mark_user_login,
     init_db,
+    reset_user_password,
     save_candidate,
+    set_user_lock_status,
+    update_user,
     get_candidates,
+    count_users_by_role,
 )
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -59,6 +67,25 @@ class AuthCredentials(BaseModel):
     password: str
 
 
+class UserCreatePayload(BaseModel):
+    name: str
+    username: str
+    email: str
+    password: str
+    role: str = "recruiter"
+
+
+class UserUpdatePayload(BaseModel):
+    name: str
+    username: str
+    email: str
+    role: str
+
+
+class PasswordResetPayload(BaseModel):
+    password: str
+
+
 def normalize_email(email: str) -> str:
     normalized_email = email.lower().strip()
     if "@" not in normalized_email or "." not in normalized_email.rsplit("@", 1)[-1]:
@@ -70,10 +97,25 @@ def normalize_email(email: str) -> str:
 def public_user(user: dict) -> dict:
     return {
         "id": user["id"],
+        "name": user.get("name"),
+        "username": user.get("username"),
         "email": user["email"],
         "role": user.get("role", "recruiter"),
+        "is_locked": bool(user.get("is_locked", 0)),
+        "last_login": user.get("last_login"),
         "created_at": user.get("created_at"),
     }
+
+
+def normalize_username(username: str) -> str:
+    normalized_username = username.lower().strip()
+    if not normalized_username:
+        raise HTTPException(status_code=400, detail="Enter a valid username.")
+
+    if " " in normalized_username:
+        raise HTTPException(status_code=400, detail="Username cannot contain spaces.")
+
+    return normalized_username
 
 
 def sign_payload(payload: dict) -> str:
@@ -196,6 +238,8 @@ def get_current_user(resumeai_session: str | None = Cookie(default=None, alias=S
     user = get_user_from_session(resumeai_session)
     if not user:
         raise HTTPException(status_code=401, detail="Not authenticated")
+    if user.get("is_locked"):
+        raise HTTPException(status_code=401, detail="Account is locked")
 
     return user
 
@@ -248,14 +292,23 @@ def login(credentials: AuthCredentials, response: Response):
     email = normalize_email(credentials.email)
     user = get_user_by_email(email)
 
-    if not user or not verify_password(credentials.password, user["password_hash"]):
+    if not user:
+        create_audit_log(email, "Login", "Invalid email or password.", "failed")
+        raise HTTPException(status_code=401, detail="Invalid email or password.")
+
+    if user.get("is_locked"):
+        create_audit_log(user["email"], "Login", "Account is locked.", "denied")
+        raise HTTPException(status_code=403, detail="Account is locked.")
+
+    if not verify_password(credentials.password, user["password_hash"]):
         create_audit_log(email, "Login", "Invalid email or password.", "failed")
         raise HTTPException(status_code=401, detail="Invalid email or password.")
 
     set_session_cookie(response, user["id"])
+    mark_user_login(user["id"])
     create_audit_log(user["email"], "Login", "User signed in.", "success")
 
-    return {"user": public_user(user)}
+    return {"user": public_user(get_user_by_id(user["id"]))}
 
 
 @app.post("/auth/logout")
@@ -274,6 +327,199 @@ def logout(
 @app.get("/auth/me")
 def me(current_user: dict = Depends(get_current_user)):
     return {"user": public_user(current_user)}
+
+
+@app.get("/users")
+def list_users(current_user: dict = Depends(require_admin)):
+    return [public_user(user) for user in get_users()]
+
+
+@app.post("/users")
+def create_user_account(payload: UserCreatePayload, current_user: dict = Depends(require_admin)):
+    name = payload.name.strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="Name is required.")
+
+    username = normalize_username(payload.username)
+    email = normalize_email(payload.email)
+
+    if len(payload.password) < 8:
+        raise HTTPException(status_code=400, detail="Password must be at least 8 characters.")
+
+    try:
+        user_id = create_user(
+            email,
+            hash_password(payload.password),
+            role=payload.role,
+            name=name,
+            username=username,
+        )
+    except sqlite3.IntegrityError:
+        raise HTTPException(status_code=400, detail="That email or username is already in use.")
+
+    created_user = get_user_by_id(user_id)
+    create_audit_log(
+        current_user["email"],
+        "User Created",
+        {
+            "user_id": user_id,
+            "name": created_user.get("name"),
+            "username": created_user.get("username"),
+            "email": created_user.get("email"),
+            "role": created_user.get("role"),
+        },
+        "success",
+    )
+    return public_user(created_user)
+
+
+@app.patch("/users/{user_id}")
+def update_user_account(user_id: int, payload: UserUpdatePayload, current_user: dict = Depends(require_admin)):
+    existing_user = get_user_by_id(user_id)
+    if not existing_user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    if existing_user.get("role") == "admin" and payload.role != "admin" and count_users_by_role("admin") <= 1:
+        raise HTTPException(status_code=400, detail="At least one admin must remain active.")
+
+    name = payload.name.strip()
+    username = normalize_username(payload.username)
+    email = normalize_email(payload.email)
+
+    try:
+        update_user(user_id, name, username, email, payload.role)
+    except sqlite3.IntegrityError:
+        raise HTTPException(status_code=400, detail="That email or username is already in use.")
+
+    updated_user = get_user_by_id(user_id)
+    if existing_user.get("role") != updated_user.get("role"):
+        create_audit_log(
+            current_user["email"],
+            "Role Changed",
+            {
+                "user_id": user_id,
+                "name": updated_user.get("name"),
+                "username": updated_user.get("username"),
+                "email": updated_user.get("email"),
+                "role": updated_user.get("role"),
+            },
+            "success",
+        )
+
+    create_audit_log(
+        current_user["email"],
+        "User Updated",
+        {
+            "user_id": user_id,
+            "name": updated_user.get("name"),
+            "username": updated_user.get("username"),
+            "email": updated_user.get("email"),
+        },
+        "success",
+    )
+    return public_user(updated_user)
+
+
+@app.post("/users/{user_id}/reset-password")
+def reset_password(user_id: int, payload: PasswordResetPayload, current_user: dict = Depends(require_admin)):
+    existing_user = get_user_by_id(user_id)
+    if not existing_user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    if len(payload.password) < 8:
+        raise HTTPException(status_code=400, detail="Password must be at least 8 characters.")
+
+    reset_user_password(user_id, hash_password(payload.password))
+    create_audit_log(
+        current_user["email"],
+        "Password Reset",
+        {
+            "user_id": user_id,
+            "name": existing_user.get("name"),
+            "username": existing_user.get("username"),
+            "email": existing_user.get("email"),
+        },
+        "success",
+    )
+    return {"status": "password_reset"}
+
+
+@app.post("/users/{user_id}/lock")
+def lock_user(user_id: int, current_user: dict = Depends(require_admin)):
+    existing_user = get_user_by_id(user_id)
+    if not existing_user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    if existing_user.get("role") == "admin" and count_users_by_role("admin") <= 1:
+        raise HTTPException(status_code=400, detail="At least one admin must remain active.")
+
+    set_user_lock_status(user_id, True)
+    create_audit_log(
+        current_user["email"],
+        "Account Locked",
+        {
+            "user_id": user_id,
+            "name": existing_user.get("name"),
+            "username": existing_user.get("username"),
+            "email": existing_user.get("email"),
+        },
+        "success",
+    )
+    return {"status": "locked"}
+
+
+@app.post("/users/{user_id}/unlock")
+def unlock_user(user_id: int, current_user: dict = Depends(require_admin)):
+    existing_user = get_user_by_id(user_id)
+    if not existing_user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    set_user_lock_status(user_id, False)
+    create_audit_log(
+        current_user["email"],
+        "Account Unlocked",
+        {
+            "user_id": user_id,
+            "name": existing_user.get("name"),
+            "username": existing_user.get("username"),
+            "email": existing_user.get("email"),
+        },
+        "success",
+    )
+    return {"status": "unlocked"}
+
+
+@app.delete("/users/{user_id}")
+def remove_user(user_id: int, current_user: dict = Depends(require_admin)):
+    existing_user = get_user_by_id(user_id)
+    if not existing_user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    if existing_user.get("role") == "admin" and count_users_by_role("admin") <= 1:
+        raise HTTPException(status_code=400, detail="At least one admin must remain active.")
+
+    deleted = delete_user_record(user_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    create_audit_log(
+        current_user["email"],
+        "User Deleted",
+        {
+            "user_id": user_id,
+            "name": existing_user.get("name"),
+            "username": existing_user.get("username"),
+            "email": existing_user.get("email"),
+            "role": existing_user.get("role"),
+        },
+        "success",
+    )
+    return {"status": "deleted"}
+
+
+@app.get("/security-dashboard")
+def security_dashboard(current_user: dict = Depends(require_admin)):
+    return get_security_dashboard_data()
 
 
 @app.post("/upload")
