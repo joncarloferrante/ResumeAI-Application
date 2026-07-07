@@ -8,6 +8,8 @@ import os
 import shutil
 import sqlite3
 import time
+from dotenv import load_dotenv
+load_dotenv()
 
 from auth_utils import hash_password, verify_password
 from resume_parser import parse_resume_file

@@ -148,6 +148,44 @@ def init_db():
     if "status" not in audit_log_columns:
         cursor.execute("ALTER TABLE audit_logs ADD COLUMN status TEXT NOT NULL DEFAULT 'success'")
 
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS jobs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            job_id TEXT UNIQUE,
+            title TEXT NOT NULL,
+            department TEXT,
+            location TEXT,
+            job_type TEXT,
+            status TEXT NOT NULL DEFAULT 'open',
+            description TEXT,
+            required_skills TEXT,
+            salary TEXT,
+            created_by TEXT,
+            updated_by TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
+    cursor.execute("PRAGMA table_info(jobs)")
+    job_columns = {row[1] for row in cursor.fetchall()}
+    for column_name, column_definition in {
+        "job_id": "TEXT UNIQUE",
+        "department": "TEXT",
+        "location": "TEXT",
+        "job_type": "TEXT",
+        "status": "TEXT NOT NULL DEFAULT 'open'",
+        "description": "TEXT",
+        "required_skills": "TEXT",
+        "salary": "TEXT",
+        "created_by": "TEXT",
+        "updated_by": "TEXT",
+        "created_at": "TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
+        "updated_at": "TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
+    }.items():
+        if column_name not in job_columns:
+            cursor.execute(f"ALTER TABLE jobs ADD COLUMN {column_name} {column_definition}")
+
     conn.commit()
     conn.close()
 
@@ -399,6 +437,23 @@ def split_normalized_skills(skills: str | None) -> list[str]:
     return normalized_skills
 
 
+def normalize_skill_key(skill: str | None) -> str:
+    return re.sub(r"[^a-z0-9+#.]+", " ", str(skill or "").lower()).strip()
+
+
+def split_job_skills(skills: str | None) -> list[str]:
+    if not skills:
+        return []
+
+    parsed_skills = []
+    for skill in re.split(r"[,;\n]+", str(skills)):
+        clean_skill = skill.strip()
+        if clean_skill:
+            parsed_skills.append(clean_skill)
+
+    return parsed_skills
+
+
 def get_analytics_summary():
     conn = get_connection()
     conn.row_factory = sqlite3.Row
@@ -561,6 +616,234 @@ def get_candidate_by_id(candidate_id: int):
     conn.close()
 
     return dict(row) if row else None
+
+
+def _row_to_job(row: sqlite3.Row | dict | None) -> dict | None:
+    if not row:
+        return None
+
+    job = dict(row)
+    required_skills = split_job_skills(job.get("required_skills"))
+    job["required_skills_list"] = required_skills
+    return job
+
+
+def _next_job_public_id(cursor) -> str:
+    cursor.execute("SELECT MAX(id) FROM jobs")
+    next_id = int(cursor.fetchone()[0] or 0) + 1
+    return f"REQ-{next_id:04d}"
+
+
+def create_job(job_data: dict, user_email: str | None) -> int:
+    conn = get_connection()
+    cursor = conn.cursor()
+    job_id = _next_job_public_id(cursor)
+
+    cursor.execute("""
+        INSERT INTO jobs (
+            job_id,
+            title,
+            department,
+            location,
+            job_type,
+            status,
+            description,
+            required_skills,
+            salary,
+            created_by,
+            updated_by
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        job_id,
+        job_data.get("title", "").strip(),
+        job_data.get("department", "").strip(),
+        job_data.get("location", "").strip(),
+        job_data.get("job_type", "").strip(),
+        job_data.get("status", "open").strip().lower(),
+        job_data.get("description", "").strip(),
+        job_data.get("required_skills", "").strip(),
+        job_data.get("salary", "").strip(),
+        user_email,
+        user_email,
+    ))
+
+    created_id = cursor.lastrowid
+    conn.commit()
+    conn.close()
+
+    return created_id
+
+
+def update_job(job_pk: int, job_data: dict, user_email: str | None) -> bool:
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        UPDATE jobs
+        SET title = ?,
+            department = ?,
+            location = ?,
+            job_type = ?,
+            status = ?,
+            description = ?,
+            required_skills = ?,
+            salary = ?,
+            updated_by = ?,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = ?
+    """, (
+        job_data.get("title", "").strip(),
+        job_data.get("department", "").strip(),
+        job_data.get("location", "").strip(),
+        job_data.get("job_type", "").strip(),
+        job_data.get("status", "open").strip().lower(),
+        job_data.get("description", "").strip(),
+        job_data.get("required_skills", "").strip(),
+        job_data.get("salary", "").strip(),
+        user_email,
+        job_pk,
+    ))
+
+    updated = cursor.rowcount > 0
+    conn.commit()
+    conn.close()
+
+    return updated
+
+
+def delete_job(job_pk: int) -> bool:
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("DELETE FROM jobs WHERE id = ?", (job_pk,))
+    deleted = cursor.rowcount > 0
+    conn.commit()
+    conn.close()
+
+    return deleted
+
+
+def get_job_by_id(job_identifier: int | str):
+    conn = get_connection()
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        SELECT id, job_id, title, department, location, job_type, status, description,
+            required_skills, salary, created_by, updated_by, created_at, updated_at
+        FROM jobs
+        WHERE id = ? OR job_id = ?
+    """, (job_identifier, str(job_identifier)))
+
+    row = cursor.fetchone()
+    conn.close()
+
+    return _row_to_job(row)
+
+
+def calculate_job_match(job: dict, candidate: dict) -> dict:
+    required_skills = split_job_skills(job.get("required_skills"))
+    candidate_skills = split_normalized_skills(candidate.get("normalized_skills")) or split_normalized_skills(candidate.get("skills"))
+    candidate_skill_keys = {normalize_skill_key(skill) for skill in candidate_skills}
+
+    matched_skills = []
+    missing_skills = []
+    for skill in required_skills:
+        skill_key = normalize_skill_key(skill)
+        if skill_key and skill_key in candidate_skill_keys:
+            matched_skills.append(skill)
+        else:
+            missing_skills.append(skill)
+
+    if required_skills:
+        match_percentage = round((len(matched_skills) / len(required_skills)) * 100)
+    else:
+        title_text = normalize_skill_key(job.get("title"))
+        role_text = normalize_skill_key(candidate.get("current_position"))
+        match_percentage = 50 if title_text and title_text in role_text else 0
+
+    return {
+        "candidate_id": candidate.get("id"),
+        "candidate_name": candidate.get("candidate"),
+        "current_position": candidate.get("current_position"),
+        "current_company": candidate.get("current_company"),
+        "location": candidate.get("location") or "Not found",
+        "years_experience": candidate.get("total_experience_years"),
+        "matched_skills": matched_skills,
+        "missing_skills": missing_skills,
+        "match_percentage": int(match_percentage),
+    }
+
+
+def get_job_matches(job_identifier: int | str):
+    job = get_job_by_id(job_identifier)
+    if not job:
+        return None
+
+    matches = [
+        calculate_job_match(job, candidate)
+        for candidate in get_candidates()
+    ]
+    matches.sort(key=lambda match: match["match_percentage"], reverse=True)
+
+    return {
+        "job": job,
+        "matches": matches,
+        "top_matches": [match for match in matches if match["match_percentage"] >= 70],
+    }
+
+
+def get_jobs():
+    conn = get_connection()
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        SELECT id, job_id, title, department, location, job_type, status, description,
+            required_skills, salary, created_by, updated_by, created_at, updated_at
+        FROM jobs
+        ORDER BY id DESC
+    """)
+    jobs = [_row_to_job(row) for row in cursor.fetchall()]
+    conn.close()
+
+    candidate_count = len(get_candidates())
+    enriched_jobs = []
+    all_top_match_counts = 0
+    open_jobs = 0
+    offers_sent = 0
+
+    for job in jobs:
+        match_data = get_job_matches(job["id"]) or {"matches": []}
+        matches = match_data["matches"]
+        top_match_percentage = matches[0]["match_percentage"] if matches else 0
+        strong_match_count = len([match for match in matches if match["match_percentage"] >= 70])
+        normalized_status = str(job.get("status") or "").lower()
+        if normalized_status == "open":
+            open_jobs += 1
+        if normalized_status in {"offer", "offer sent", "offers sent"}:
+            offers_sent += 1
+        all_top_match_counts += strong_match_count
+
+        enriched_jobs.append({
+            **job,
+            "applicants": candidate_count,
+            "top_match_percentage": top_match_percentage,
+            "strong_match_count": strong_match_count,
+        })
+
+    return {
+        "jobs": enriched_jobs,
+        "summary": {
+            "total_jobs": len(enriched_jobs),
+            "open_jobs": open_jobs,
+            "active_candidates": candidate_count,
+            "strong_matches": all_top_match_counts,
+            "offers_sent": offers_sent,
+            "average_time_to_fill": "N/A",
+        },
+    }
 
 
 def get_users():

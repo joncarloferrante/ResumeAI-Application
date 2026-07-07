@@ -28,9 +28,40 @@ const auditActionOptions = [
   "Candidate Delete",
   "Candidate View",
   "Audit Logs View",
+  "Job Created",
+  "Job Updated",
+  "Job Deleted",
+  "Job View",
+  "Job Matches View",
 ];
 
 const auditStatusOptions = ["All Statuses", "Success", "Failed", "Denied", "Warning"];
+
+const jobStatusOptions = ["open", "paused", "closed", "draft", "offer sent"];
+const jobTypeOptions = ["Full-time", "Contract", "Contract-to-hire", "Part-time", "Temporary"];
+
+const emptyJobBoard = {
+  jobs: [],
+  summary: {
+    total_jobs: 0,
+    open_jobs: 0,
+    active_candidates: 0,
+    strong_matches: 0,
+    offers_sent: 0,
+    average_time_to_fill: "N/A",
+  },
+};
+
+const emptyJobForm = {
+  title: "",
+  department: "",
+  location: "",
+  job_type: "Full-time",
+  status: "open",
+  description: "",
+  required_skills: "",
+  salary: "",
+};
 
 const emptyAnalytics = {
   summary: {
@@ -118,6 +149,35 @@ function formatMetric(value, fractionDigits = 0) {
     maximumFractionDigits: fractionDigits,
     minimumFractionDigits: fractionDigits,
   });
+}
+
+function formatLabel(value) {
+  return String(value || "")
+    .replace(/[_-]+/g, " ")
+    .trim()
+    .replace(/\b\w/g, (letter) => letter.toUpperCase()) || "Not found";
+}
+
+function formatPercent(value) {
+  const numberValue = Number(value);
+  if (!Number.isFinite(numberValue)) {
+    return "0%";
+  }
+
+  return `${Math.round(numberValue)}%`;
+}
+
+function formatFileSize(size) {
+  const sizeValue = Number(size);
+  if (!Number.isFinite(sizeValue) || sizeValue <= 0) {
+    return "0 KB";
+  }
+
+  if (sizeValue < 1024 * 1024) {
+    return `${Math.max(1, Math.round(sizeValue / 1024))} KB`;
+  }
+
+  return `${(sizeValue / (1024 * 1024)).toFixed(1)} MB`;
 }
 
 function compareValues(firstValue, secondValue) {
@@ -220,6 +280,25 @@ function UploadIcon() {
       <path d="M12 16V5" />
       <path d="m7.5 9.5 4.5-4.5 4.5 4.5" />
       <path d="M4.5 19.5h15" />
+    </AppIcon>
+  );
+}
+
+function CheckIcon() {
+  return (
+    <AppIcon>
+      <path d="m6.5 12.4 3.2 3.1 7.8-8" />
+    </AppIcon>
+  );
+}
+
+function FileIcon() {
+  return (
+    <AppIcon>
+      <path d="M7 4.5h7l3 3V19a1 1 0 0 1-1 1H7a1 1 0 0 1-1-1V5.5a1 1 0 0 1 1-1Z" />
+      <path d="M13.5 4.5V8H17" />
+      <path d="M9 12h6" />
+      <path d="M9 15.5h4.5" />
     </AppIcon>
   );
 }
@@ -394,6 +473,9 @@ function App() {
   const [message, setMessage] = useState("");
   const [candidates, setCandidates] = useState([]);
   const [isUploading, setIsUploading] = useState(false);
+  const [uploadProgress, setUploadProgress] = useState(0);
+  const [uploadStatus, setUploadStatus] = useState("idle");
+  const [uploadError, setUploadError] = useState("");
   const [isLoadingCandidates, setIsLoadingCandidates] = useState(false);
   const [candidateError, setCandidateError] = useState("");
   const [candidateStatus, setCandidateStatus] = useState("");
@@ -408,6 +490,25 @@ function App() {
   const [analytics, setAnalytics] = useState(emptyAnalytics);
   const [isLoadingAnalytics, setIsLoadingAnalytics] = useState(false);
   const [analyticsError, setAnalyticsError] = useState("");
+  const [jobBoard, setJobBoard] = useState(emptyJobBoard);
+  const [isLoadingJobs, setIsLoadingJobs] = useState(false);
+  const [jobBoardError, setJobBoardError] = useState("");
+  const [jobFilters, setJobFilters] = useState({
+    query: "",
+    department: "All Departments",
+    location: "All Locations",
+    status: "All Statuses",
+    jobType: "All Types",
+  });
+  const [currentJobPage, setCurrentJobPage] = useState(1);
+  const [selectedJob, setSelectedJob] = useState(null);
+  const [jobMatches, setJobMatches] = useState([]);
+  const [isLoadingJobMatches, setIsLoadingJobMatches] = useState(false);
+  const [jobMatchTab, setJobMatchTab] = useState("top");
+  const [isJobModalOpen, setIsJobModalOpen] = useState(false);
+  const [jobForm, setJobForm] = useState(emptyJobForm);
+  const [isSavingJob, setIsSavingJob] = useState(false);
+  const [jobActionMessage, setJobActionMessage] = useState("");
   const [users, setUsers] = useState([]);
   const [isLoadingUsers, setIsLoadingUsers] = useState(false);
   const [usersError, setUsersError] = useState("");
@@ -432,15 +533,18 @@ function App() {
   const [userActionMessage, setUserActionMessage] = useState("");
   const [auditFilters, setAuditFilters] = useState({
     query: "",
+    user: "All Users",
     action: "All Actions",
     status: "All Statuses",
     startDate: "",
     endDate: "",
   });
+  const [currentAuditPage, setCurrentAuditPage] = useState(1);
   const [currentCandidatePage, setCurrentCandidatePage] = useState(1);
   const [lastCandidatesRefresh, setLastCandidatesRefresh] = useState(null);
   const [isDraggingUpload, setIsDraggingUpload] = useState(false);
   const uploadInputRef = useRef(null);
+  const uploadProgressTimerRef = useRef(null);
 
   const isAdmin = user?.role === "admin";
   const navigationItems = useMemo(
@@ -453,6 +557,48 @@ function App() {
   );
   const candidatesPerPage = 10;
   const safeActivePage = allowedPages.has(activePage) ? activePage : "candidates";
+
+  const stopUploadProgressSimulation = useCallback(() => {
+    if (uploadProgressTimerRef.current) {
+      window.clearInterval(uploadProgressTimerRef.current);
+      uploadProgressTimerRef.current = null;
+    }
+  }, []);
+
+  const beginUploadProgressSimulation = useCallback(() => {
+    stopUploadProgressSimulation();
+    setUploadStatus("uploading");
+    setUploadError("");
+    setUploadProgress(6);
+
+    uploadProgressTimerRef.current = window.setInterval(() => {
+      setUploadProgress((currentProgress) => {
+        if (currentProgress >= 90) {
+          return 90;
+        }
+
+        const remainingProgress = 90 - currentProgress;
+        const nextStep = Math.max(0.5, Math.min(7, remainingProgress * 0.16));
+        return Math.min(90, currentProgress + nextStep);
+      });
+    }, 320);
+  }, [stopUploadProgressSimulation]);
+
+  const completeUploadProgress = useCallback(() => {
+    stopUploadProgressSimulation();
+    setUploadProgress(100);
+    setUploadStatus("success");
+    setUploadError("");
+  }, [stopUploadProgressSimulation]);
+
+  const failUploadProgress = useCallback(
+    (errorMessage) => {
+      stopUploadProgressSimulation();
+      setUploadStatus("error");
+      setUploadError(errorMessage);
+    },
+    [stopUploadProgressSimulation],
+  );
 
   const visibleCandidates = useMemo(() => {
     const normalizedQuery = searchQuery.trim().toLowerCase();
@@ -527,6 +673,7 @@ function App() {
 
   const visibleAuditLogs = useMemo(() => {
     const normalizedQuery = auditFilters.query.trim().toLowerCase();
+    const selectedUser = auditFilters.user === "All Users" ? "" : auditFilters.user;
     const selectedAction = auditFilters.action === "All Actions" ? "" : auditFilters.action;
     const selectedStatus =
       auditFilters.status === "All Statuses" ? "" : auditFilters.status.toLowerCase();
@@ -543,6 +690,7 @@ function App() {
               .toLowerCase()
               .includes(normalizedQuery),
           );
+        const matchesUser = !selectedUser || log.user_email === selectedUser;
         const matchesAction = !selectedAction || log.action === selectedAction;
         const matchesStatus = !selectedStatus || status === selectedStatus;
         const matchesStartDate = !auditFilters.startDate || logDate >= auditFilters.startDate;
@@ -550,6 +698,7 @@ function App() {
 
         return (
           matchesQuery &&
+          matchesUser &&
           matchesAction &&
           matchesStatus &&
           matchesStartDate &&
@@ -564,8 +713,77 @@ function App() {
   }, [auditFilters, auditLogs]);
 
   const hasAuditFilters = Object.values(auditFilters).some(
-    (value) => value && value !== "All Actions" && value !== "All Statuses",
+    (value) =>
+      value && value !== "All Users" && value !== "All Actions" && value !== "All Statuses",
   );
+
+  const auditUserOptions = useMemo(
+    () =>
+      Array.from(new Set(auditLogs.map((log) => log.user_email).filter(Boolean))).sort((first, second) =>
+        String(first).localeCompare(String(second), undefined, {
+          sensitivity: "base",
+        }),
+      ),
+    [auditLogs],
+  );
+
+  const auditLogsPerPage = 10;
+  const totalAuditPages = Math.max(1, Math.ceil(visibleAuditLogs.length / auditLogsPerPage));
+  const paginatedAuditLogs = useMemo(() => {
+    const startIndex = (currentAuditPage - 1) * auditLogsPerPage;
+    return visibleAuditLogs.slice(startIndex, startIndex + auditLogsPerPage);
+  }, [currentAuditPage, visibleAuditLogs]);
+  const auditStart = visibleAuditLogs.length === 0 ? 0 : (currentAuditPage - 1) * auditLogsPerPage + 1;
+  const auditEnd = Math.min(currentAuditPage * auditLogsPerPage, visibleAuditLogs.length);
+
+  const jobs = useMemo(() => jobBoard.jobs || [], [jobBoard.jobs]);
+  const visibleJobs = useMemo(() => {
+    const normalizedQuery = jobFilters.query.trim().toLowerCase();
+
+    return jobs.filter((job) => {
+      const matchesQuery =
+        !normalizedQuery ||
+        [job.title, job.job_id, job.department, job.location, job.required_skills, job.description].some((value) =>
+          String(value ?? "")
+            .toLowerCase()
+            .includes(normalizedQuery),
+        );
+      const matchesDepartment =
+        jobFilters.department === "All Departments" || job.department === jobFilters.department;
+      const matchesLocation =
+        jobFilters.location === "All Locations" || job.location === jobFilters.location;
+      const matchesStatus =
+        jobFilters.status === "All Statuses" || job.status === jobFilters.status;
+      const matchesJobType =
+        jobFilters.jobType === "All Types" || job.job_type === jobFilters.jobType;
+
+      return matchesQuery && matchesDepartment && matchesLocation && matchesStatus && matchesJobType;
+    });
+  }, [jobFilters, jobs]);
+
+  const jobDepartments = useMemo(
+    () => Array.from(new Set(jobs.map((job) => job.department).filter(Boolean))).sort(),
+    [jobs],
+  );
+  const jobLocations = useMemo(
+    () => Array.from(new Set(jobs.map((job) => job.location).filter(Boolean))).sort(),
+    [jobs],
+  );
+  const availableJobTypes = useMemo(
+    () => Array.from(new Set([...jobTypeOptions, ...jobs.map((job) => job.job_type).filter(Boolean)])),
+    [jobs],
+  );
+  const jobsPerPage = 8;
+  const totalJobPages = Math.max(1, Math.ceil(visibleJobs.length / jobsPerPage));
+  const paginatedJobs = useMemo(() => {
+    const startIndex = (currentJobPage - 1) * jobsPerPage;
+    return visibleJobs.slice(startIndex, startIndex + jobsPerPage);
+  }, [currentJobPage, visibleJobs]);
+  const jobStart = visibleJobs.length === 0 ? 0 : (currentJobPage - 1) * jobsPerPage + 1;
+  const jobEnd = Math.min(currentJobPage * jobsPerPage, visibleJobs.length);
+  const selectedJobMatches = jobMatchTab === "top"
+    ? jobMatches.filter((match) => Number(match.match_percentage) >= 70)
+    : jobMatches;
 
   const handleUserRoleChange = async (targetUser, nextRole) => {
     if (!targetUser || targetUser.role === nextRole) {
@@ -650,6 +868,7 @@ function App() {
   const clearAuditFilters = () => {
     setAuditFilters({
       query: "",
+      user: "All Users",
       action: "All Actions",
       status: "All Statuses",
       startDate: "",
@@ -702,6 +921,66 @@ function App() {
       }
     } finally {
       setIsLoadingAnalytics(false);
+    }
+  }, []);
+
+  const loadJobs = useCallback(async () => {
+    setIsLoadingJobs(true);
+    setJobBoardError("");
+
+    try {
+      const response = await api.get("/jobs");
+      const nextJobBoard = response.data || emptyJobBoard;
+      const nextJobs = nextJobBoard.jobs || [];
+      setJobBoard({
+        jobs: nextJobs,
+        summary: nextJobBoard.summary || emptyJobBoard.summary,
+      });
+      setSelectedJob((currentJob) => {
+        if (!currentJob) {
+          return nextJobs[0] || null;
+        }
+
+        return nextJobs.find((job) => job.id === currentJob.id) || nextJobs[0] || null;
+      });
+      return true;
+    } catch (error) {
+      console.error(error);
+      if (error.response?.status === 401) {
+        setUser(null);
+        setJobBoardError("");
+      } else {
+        setJobBoardError("Could not load job board.");
+      }
+      return false;
+    } finally {
+      setIsLoadingJobs(false);
+    }
+  }, []);
+
+  const loadJobMatches = useCallback(async (job) => {
+    if (!job) {
+      setJobMatches([]);
+      return false;
+    }
+
+    setIsLoadingJobMatches(true);
+
+    try {
+      const response = await api.get(`/jobs/${job.id}/matches`);
+      setJobMatches(response.data.matches || []);
+      return true;
+    } catch (error) {
+      console.error(error);
+      if (error.response?.status === 401) {
+        setUser(null);
+      } else {
+        setJobBoardError("Could not load candidate matches.");
+      }
+      setJobMatches([]);
+      return false;
+    } finally {
+      setIsLoadingJobMatches(false);
     }
   }, []);
 
@@ -809,6 +1088,9 @@ function App() {
       setSelectedCandidate(null);
       setAuditLogs([]);
       setAnalytics(emptyAnalytics);
+      setJobBoard(emptyJobBoard);
+      setSelectedJob(null);
+      setJobMatches([]);
       setActivePage("candidates");
       setLastCandidatesRefresh(null);
       setLastUsersRefresh(null);
@@ -827,6 +1109,18 @@ function App() {
       loadAnalytics();
     }
   }, [loadAnalytics, safeActivePage, user]);
+
+  useEffect(() => {
+    if (safeActivePage === "jobBoard" && user) {
+      loadJobs();
+    }
+  }, [loadJobs, safeActivePage, user]);
+
+  useEffect(() => {
+    if (safeActivePage === "jobBoard" && selectedJob && user) {
+      loadJobMatches(selectedJob);
+    }
+  }, [loadJobMatches, safeActivePage, selectedJob, user]);
 
   useEffect(() => {
     if (safeActivePage === "users" && user) {
@@ -850,6 +1144,28 @@ function App() {
       loadAuditLogs();
     }
   }, [loadAuditLogs, loadSecurityDashboard, safeActivePage, user]);
+
+  useEffect(() => stopUploadProgressSimulation, [stopUploadProgressSimulation]);
+
+  useEffect(() => {
+    setCurrentAuditPage(1);
+  }, [auditFilters, auditLogs]);
+
+  useEffect(() => {
+    if (currentAuditPage > totalAuditPages) {
+      setCurrentAuditPage(totalAuditPages);
+    }
+  }, [currentAuditPage, totalAuditPages]);
+
+  useEffect(() => {
+    setCurrentJobPage(1);
+  }, [jobFilters, jobs]);
+
+  useEffect(() => {
+    if (currentJobPage > totalJobPages) {
+      setCurrentJobPage(totalJobPages);
+    }
+  }, [currentJobPage, totalJobPages]);
 
   useEffect(() => {
     if (!selectedCandidate) {
@@ -906,6 +1222,9 @@ function App() {
       setCandidates([]);
       setAuditLogs([]);
       setAnalytics(emptyAnalytics);
+      setJobBoard(emptyJobBoard);
+      setSelectedJob(null);
+      setJobMatches([]);
       setUsers([]);
       setSecurityDashboard(emptySecurityDashboard);
       setActivePage("candidates");
@@ -916,11 +1235,16 @@ function App() {
       setUserModalMode(null);
       setUserModalUser(null);
       setUserActionMessage("");
+      setJobActionMessage("");
       setAuditLogError("");
     }
   };
 
   const handleUpload = async () => {
+    if (isUploading) {
+      return;
+    }
+
     if (files.length === 0) {
       setMessage("Please select at least one resume first.");
       return;
@@ -928,6 +1252,7 @@ function App() {
 
     setIsUploading(true);
     setMessage("");
+    beginUploadProgressSimulation();
 
     try {
       const successes = [];
@@ -949,6 +1274,7 @@ function App() {
           console.error(error);
           const detail = error.response?.data?.detail;
           if (error.response?.status === 401) {
+            failUploadProgress("Your session expired. Please sign in again.");
             setUser(null);
             setMessage("Your session expired. Please sign in again.");
             return;
@@ -958,26 +1284,35 @@ function App() {
         }
       }
 
-      setMessage(
-        failures.length
-          ? `${successes.length} uploaded, ${failures.length} failed. ${failures.join("; ")}`
-          : `${successes.length} resume${successes.length === 1 ? "" : "s"} uploaded successfully.`,
-      );
-      setFiles([]);
-      if (uploadInputRef.current) {
-        uploadInputRef.current.value = "";
+      if (failures.length) {
+        const failureMessage = `${successes.length} uploaded, ${failures.length} failed. ${failures.join("; ")}`;
+        failUploadProgress(failureMessage);
+        setMessage(failureMessage);
+      } else {
+        completeUploadProgress();
+        setMessage(
+          `${successes.length} resume${successes.length === 1 ? "" : "s"} uploaded successfully.`,
+        );
+        setFiles([]);
+        if (uploadInputRef.current) {
+          uploadInputRef.current.value = "";
+        }
       }
       await loadCandidates();
     } catch (error) {
       console.error(error);
       const detail = error.response?.data?.detail;
       if (error.response?.status === 401) {
+        failUploadProgress("Your session expired. Please sign in again.");
         setUser(null);
         setMessage("Your session expired. Please sign in again.");
       } else if (error.response?.status === 409 && detail) {
+        failUploadProgress(detail);
         setMessage(detail);
       } else {
-        setMessage(detail ? `Upload failed: ${detail}` : "Upload failed.");
+        const failureMessage = detail ? `Upload failed: ${detail}` : "Upload failed.";
+        failUploadProgress(failureMessage);
+        setMessage(failureMessage);
       }
     } finally {
       setIsUploading(false);
@@ -985,6 +1320,10 @@ function App() {
   };
 
   const selectUploadFiles = (selectedFiles) => {
+    if (isUploading) {
+      return;
+    }
+
     const nextFiles = Array.from(selectedFiles ?? []).filter(Boolean);
 
     if (nextFiles.length === 0) {
@@ -1000,6 +1339,9 @@ function App() {
     }
 
     if (supportedFiles.length > 0) {
+      setUploadProgress(0);
+      setUploadStatus("idle");
+      setUploadError("");
       setFiles((currentFiles) => [...currentFiles, ...supportedFiles]);
       nextMessage =
         nextMessage ||
@@ -1013,6 +1355,10 @@ function App() {
     event.preventDefault();
     setIsDraggingUpload(false);
 
+    if (isUploading) {
+      return;
+    }
+
     selectUploadFiles(event.dataTransfer.files);
   };
 
@@ -1022,10 +1368,76 @@ function App() {
   };
 
   const clearUploadSelection = () => {
+    stopUploadProgressSimulation();
     setFiles([]);
     setMessage("");
+    setUploadProgress(0);
+    setUploadStatus("idle");
+    setUploadError("");
     if (uploadInputRef.current) {
       uploadInputRef.current.value = "";
+    }
+  };
+
+  const updateJobFilter = (key, value) => {
+    setJobFilters((currentFilters) => ({
+      ...currentFilters,
+      [key]: value,
+    }));
+  };
+
+  const handleSelectJob = (job) => {
+    setSelectedJob(job);
+    setJobMatchTab("top");
+  };
+
+  const closeJobModal = () => {
+    setIsJobModalOpen(false);
+    setJobForm(emptyJobForm);
+    setJobActionMessage("");
+  };
+
+  const handleCreateJob = async (event) => {
+    event.preventDefault();
+    setIsSavingJob(true);
+    setJobActionMessage("");
+
+    try {
+      const response = await api.post("/jobs", jobForm);
+      closeJobModal();
+      await loadJobs();
+      setSelectedJob(response.data);
+      setJobBoardError("");
+    } catch (error) {
+      console.error(error);
+      const detail = error.response?.data?.detail;
+      if (error.response?.status === 401) {
+        setUser(null);
+      } else {
+        setJobActionMessage(detail || "Could not create job requisition.");
+      }
+    } finally {
+      setIsSavingJob(false);
+    }
+  };
+
+  const handleDeleteJob = async (job) => {
+    const confirmed = window.confirm(`Delete ${job.title}?`);
+    if (!confirmed) {
+      return;
+    }
+
+    try {
+      await api.delete(`/jobs/${job.id}`);
+      await loadJobs();
+      if (selectedJob?.id === job.id) {
+        setSelectedJob(null);
+        setJobMatches([]);
+      }
+    } catch (error) {
+      console.error(error);
+      const detail = error.response?.data?.detail;
+      setJobBoardError(detail || "Could not delete job.");
     }
   };
 
@@ -1078,90 +1490,144 @@ function App() {
     }
   };
 
-  const renderUploadPage = () => (
-    <section className="page-stack">
-      <header className="page-header">
-        <div>
-          <p className="section-kicker">Ingestion</p>
-          <h1>Upload Resume</h1>
-          <p className="subtitle">Add a new parsed candidate to the shared recruiting workspace.</p>
-        </div>
-      </header>
+  const renderUploadPage = () => {
+    const shouldShowUploadProgress = uploadStatus !== "idle";
+    const progressLabel = `${Math.round(uploadProgress)}%`;
 
-      <section className={`upload-surface ${isDraggingUpload ? "is-dragging" : ""}`}>
-        <label
-          className="upload-dropzone"
-          onDragEnter={() => setIsDraggingUpload(true)}
-          onDragLeave={(event) => {
-            if (event.currentTarget === event.target) {
-              setIsDraggingUpload(false);
-            }
-          }}
-          onDragOver={(event) => {
-            event.preventDefault();
-            setIsDraggingUpload(true);
-          }}
-          onDrop={handleUploadZoneDrop}
-        >
-          <input
-            ref={uploadInputRef}
-            className="upload-input"
-            type="file"
-            multiple
-            accept=".pdf,.doc,.docx"
-            onChange={handleUploadZoneBrowse}
-          />
+    return (
+      <section className="page-stack">
+        <header className="page-header">
+          <div>
+            <p className="section-kicker">Ingestion</p>
+            <h1>Upload Resume</h1>
+            <p className="subtitle">Add a new parsed candidate to the shared recruiting workspace.</p>
+          </div>
+        </header>
 
-          <div className="upload-dropzone-copy">
-            <div className="upload-badge" aria-hidden="true">
-              <UploadIcon />
+        <section className={`upload-surface ${isDraggingUpload ? "is-dragging" : ""}`}>
+          <label
+            className="upload-dropzone"
+            onDragEnter={() => !isUploading && setIsDraggingUpload(true)}
+            onDragLeave={(event) => {
+              if (event.currentTarget === event.target) {
+                setIsDraggingUpload(false);
+              }
+            }}
+            onDragOver={(event) => {
+              event.preventDefault();
+              if (!isUploading) {
+                setIsDraggingUpload(true);
+              }
+            }}
+            onDrop={handleUploadZoneDrop}
+          >
+            <input
+              ref={uploadInputRef}
+              className="upload-input"
+              type="file"
+              multiple
+              accept=".pdf,.doc,.docx"
+              onChange={handleUploadZoneBrowse}
+              disabled={isUploading}
+            />
+
+            <div className="upload-dropzone-copy">
+              <div className="upload-badge" aria-hidden="true">
+                <UploadIcon />
+              </div>
+              <div>
+                <h2>Drag and drop a resume here</h2>
+                <p className="subtitle">
+                  Drop a PDF, DOC, or DOCX file, or click anywhere in this area to browse.
+                </p>
+              </div>
             </div>
-            <div>
-              <h2>Drag and drop a resume here</h2>
-              <p className="subtitle">
-                Drop a PDF, DOC, or DOCX file, or click anywhere in this area to browse.
-              </p>
+
+            <div className="upload-dropzone-meta">
+              <span>Accepted files</span>
+              <strong>PDF, DOC, DOCX</strong>
             </div>
-          </div>
+          </label>
 
-          <div className="upload-dropzone-meta">
-            <span>Accepted files</span>
-            <strong>PDF, DOC, DOCX</strong>
-          </div>
-        </label>
+          <div className="upload-actions">
+            <div className="upload-file-panel">
+              <div className="upload-file-panel-header">
+                <span>Selected files</span>
+                <strong>
+                  {files.length ? `${files.length} file${files.length === 1 ? "" : "s"} selected` : "No files selected"}
+                </strong>
+              </div>
 
-        <div className="upload-actions">
-          <div className="upload-file-pill">
-            <span>Selected files</span>
-            <strong>{files.length ? `${files.length} file${files.length === 1 ? "" : "s"} selected` : "No files selected"}</strong>
-          </div>
-
-          {files.length > 0 && (
-            <div className="selected-file-list" aria-label="Selected resume files">
-              {files.map((file) => (
-                <span key={`${file.name}-${file.lastModified}`} title={file.name}>
-                  {file.name}
-                </span>
-              ))}
+              {files.length > 0 && (
+                <div className="selected-file-list" aria-label="Selected resume files">
+                  {files.map((file) => (
+                    <div className="selected-file-row" key={`${file.name}-${file.lastModified}`}>
+                      <span className="selected-file-icon" aria-hidden="true">
+                        <FileIcon />
+                      </span>
+                      <div>
+                        <strong title={file.name}>{file.name}</strong>
+                        <span>{formatFileSize(file.size)}</span>
+                      </div>
+                      <span className="selected-file-check" aria-hidden="true">
+                        <CheckIcon />
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              )}
             </div>
-          )}
 
-          <div className="upload-action-buttons">
-            <button className="secondary-button" type="button" onClick={clearUploadSelection} disabled={!files.length && !message}>
-              Clear
-            </button>
-            <button className="primary-button" onClick={handleUpload} disabled={isUploading || files.length === 0}>
-              {isUploading ? "Uploading..." : "Upload Resume"}
-            </button>
+            {shouldShowUploadProgress && (
+              <div className={`upload-progress-card is-${uploadStatus}`} role="status" aria-live="polite">
+                <div className="upload-progress-head">
+                  <strong>
+                    {uploadStatus === "success"
+                      ? "Complete!"
+                      : uploadStatus === "error"
+                        ? "Upload failed"
+                        : "Uploading and parsing resume..."}
+                  </strong>
+                  <span>{progressLabel}</span>
+                </div>
+
+                <div className="upload-progress-track" aria-hidden="true">
+                  <span style={{ width: `${Math.min(100, Math.max(0, uploadProgress))}%` }} />
+                </div>
+
+                {uploadStatus === "success" ? (
+                  <div className="upload-progress-result">
+                    <span className="upload-result-icon" aria-hidden="true">
+                      <CheckIcon />
+                    </span>
+                    <div>
+                      <strong>Complete!</strong>
+                      <p>Resume uploaded and parsed successfully.</p>
+                    </div>
+                  </div>
+                ) : uploadStatus === "error" ? (
+                  <p className="upload-progress-error">{uploadError || "Upload failed."}</p>
+                ) : null}
+              </div>
+            )}
+
+            <div className="upload-action-buttons">
+              <button className="secondary-button" type="button" onClick={clearUploadSelection} disabled={!files.length && !message && uploadStatus === "idle"}>
+                Clear
+              </button>
+              <button className="primary-button" onClick={handleUpload} disabled={isUploading || files.length === 0}>
+                {isUploading ? "Uploading..." : "Upload Resume"}
+              </button>
+            </div>
+
+            <p className="status-message">
+              {message || "The file will be uploaded with the existing backend endpoint."}
+            </p>
           </div>
-
-          <p className="status-message">
-            {message || "The file will be uploaded with the existing backend endpoint."}
-          </p>
-        </div>
+        </section>
       </section>
-    </section>
-  );
+    );
+  };
 
   const renderCandidatesPage = () => (
     <section className="page-stack candidates-stack">
@@ -1358,15 +1824,14 @@ function App() {
     </section>
   );
 
-  const renderAuditLogsPage = () => (
-    <section className="page-stack">
-      <header className="page-header">
+  const renderAuditLogsSection = () => (
+    <section className="surface-block audit-log-section">
+      <div className="surface-header">
         <div>
-          <p className="section-kicker">System activity</p>
-          <h1>Audit Logs</h1>
-          <p className="subtitle">Search and review administrative actions across the platform.</p>
+          <h2>Audit Logs</h2>
+          <p className="subtitle">Events sourced from the existing audit log.</p>
         </div>
-      </header>
+      </div>
 
       <div className="audit-filters">
         <label className="audit-filter audit-search-field">
@@ -1377,6 +1842,21 @@ function App() {
             onChange={(event) => updateAuditFilter("query", event.target.value)}
             placeholder="Search user, action, details, or status..."
           />
+        </label>
+
+        <label className="audit-filter">
+          <span>User</span>
+          <select
+            value={auditFilters.user}
+            onChange={(event) => updateAuditFilter("user", event.target.value)}
+          >
+            <option value="All Users">All Users</option>
+            {auditUserOptions.map((auditUser) => (
+              <option key={auditUser} value={auditUser}>
+                {auditUser}
+              </option>
+            ))}
+          </select>
         </label>
 
         <label className="audit-filter">
@@ -1462,7 +1942,7 @@ function App() {
                 </td>
               </tr>
             ) : (
-              visibleAuditLogs.map((log) => (
+              paginatedAuditLogs.map((log) => (
                 <tr key={log.id}>
                   <td>
                     <TableValue value={log.timestamp} />
@@ -1487,6 +1967,52 @@ function App() {
           </tbody>
         </table>
       </div>
+
+      <div className="table-footer">
+        <div className="table-summary">
+          {visibleAuditLogs.length === 0
+            ? "Showing 0 audit logs"
+            : `Showing ${auditStart}-${auditEnd} of ${visibleAuditLogs.length} audit logs`}
+        </div>
+
+        <div className="pagination-controls">
+          <button
+            className="pagination-button"
+            type="button"
+            onClick={() => setCurrentAuditPage((page) => Math.max(page - 1, 1))}
+            disabled={currentAuditPage === 1}
+            aria-label="Previous audit log page"
+          >
+            <ChevronLeftIcon />
+          </button>
+          <span className="pagination-status">
+            Page {currentAuditPage} of {totalAuditPages}
+          </span>
+          <button
+            className="pagination-button"
+            type="button"
+            onClick={() => setCurrentAuditPage((page) => Math.min(page + 1, totalAuditPages))}
+            disabled={currentAuditPage === totalAuditPages}
+            aria-label="Next audit log page"
+          >
+            <ChevronRightIcon />
+          </button>
+        </div>
+      </div>
+    </section>
+  );
+
+  const renderAuditLogsPage = () => (
+    <section className="page-stack">
+      <header className="page-header">
+        <div>
+          <p className="section-kicker">System activity</p>
+          <h1>Audit Logs</h1>
+          <p className="subtitle">Search and review administrative actions across the platform.</p>
+        </div>
+      </header>
+
+      {renderAuditLogsSection()}
     </section>
   );
 
@@ -1983,6 +2509,347 @@ function App() {
     );
   };
 
+  const renderJobBoardPage = () => {
+    const summary = jobBoard.summary || emptyJobBoard.summary;
+    const jobCards = [
+      { label: "Total Jobs", value: formatMetric(summary.total_jobs) },
+      { label: "Open Jobs", value: formatMetric(summary.open_jobs) },
+      { label: "Active Candidates", value: formatMetric(summary.active_candidates) },
+      { label: "Strong Matches", value: formatMetric(summary.strong_matches) },
+      { label: "Offers Sent", value: formatMetric(summary.offers_sent) },
+      { label: "Average Time to Fill", value: summary.average_time_to_fill || "N/A" },
+    ];
+
+    return (
+      <section className="page-stack job-board-page">
+        <header className="page-header candidates-header">
+          <div>
+            <p className="section-kicker">Recruiting workspace</p>
+            <h1>Job Board</h1>
+            <p className="subtitle">Track requisitions, candidate matches, and hiring pipeline coverage.</p>
+          </div>
+
+          <button
+            className="primary-button add-user-button"
+            type="button"
+            onClick={() => {
+              setJobForm(emptyJobForm);
+              setJobActionMessage("");
+              setIsJobModalOpen(true);
+            }}
+          >
+            Create Job Requisition
+          </button>
+        </header>
+
+        {jobBoardError && <p className="error-message">{jobBoardError}</p>}
+
+        <div className="metric-grid job-metric-grid">
+          {jobCards.map((card) => (
+            <MetricCard key={card.label} {...card} />
+          ))}
+        </div>
+
+        <section className="surface-block job-filter-panel">
+          <div className="job-filters">
+            <label className="search-field job-search-field">
+              <span>Search jobs</span>
+              <div className="search-input-wrap">
+                <SearchIcon />
+                <input
+                  type="search"
+                  value={jobFilters.query}
+                  onChange={(event) => updateJobFilter("query", event.target.value)}
+                  placeholder="Search title, keyword, or job ID..."
+                />
+              </div>
+            </label>
+
+            <label className="audit-filter">
+              <span>Department</span>
+              <select
+                value={jobFilters.department}
+                onChange={(event) => updateJobFilter("department", event.target.value)}
+              >
+                <option>All Departments</option>
+                {jobDepartments.map((department) => (
+                  <option key={department}>{department}</option>
+                ))}
+              </select>
+            </label>
+
+            <label className="audit-filter">
+              <span>Location</span>
+              <select
+                value={jobFilters.location}
+                onChange={(event) => updateJobFilter("location", event.target.value)}
+              >
+                <option>All Locations</option>
+                {jobLocations.map((location) => (
+                  <option key={location}>{location}</option>
+                ))}
+              </select>
+            </label>
+
+            <label className="audit-filter">
+              <span>Status</span>
+              <select
+                value={jobFilters.status}
+                onChange={(event) => updateJobFilter("status", event.target.value)}
+              >
+                <option>All Statuses</option>
+                {jobStatusOptions.map((status) => (
+                  <option key={status} value={status}>
+                    {formatLabel(status)}
+                  </option>
+                ))}
+              </select>
+            </label>
+
+            <label className="audit-filter">
+              <span>Job Type</span>
+              <select
+                value={jobFilters.jobType}
+                onChange={(event) => updateJobFilter("jobType", event.target.value)}
+              >
+                <option>All Types</option>
+                {availableJobTypes.map((jobType) => (
+                  <option key={jobType}>{jobType}</option>
+                ))}
+              </select>
+            </label>
+          </div>
+        </section>
+
+        <div className="job-board-layout">
+          <section className="surface-block">
+            <div className="surface-header">
+              <div>
+                <h2>Job Requisitions</h2>
+                <p className="subtitle">Open roles sourced from the recruiting database.</p>
+              </div>
+            </div>
+
+            <div className="table-shell job-table-shell">
+              <table className="data-table job-table">
+                <thead>
+                  <tr>
+                    <th>Job Title</th>
+                    <th>Department</th>
+                    <th>Location</th>
+                    <th>Applicants</th>
+                    <th>Top Match %</th>
+                    <th>Status</th>
+                    <th>Posted Date</th>
+                    <th>Actions</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {jobs.length === 0 ? (
+                    <tr>
+                      <td className="empty-state" colSpan="8">
+                        {isLoadingJobs ? "Loading jobs..." : "No job requisitions created yet."}
+                      </td>
+                    </tr>
+                  ) : visibleJobs.length === 0 ? (
+                    <tr>
+                      <td className="empty-state" colSpan="8">
+                        No jobs match your filters.
+                      </td>
+                    </tr>
+                  ) : (
+                    paginatedJobs.map((job) => (
+                      <tr key={job.id} className={selectedJob?.id === job.id ? "is-selected-row" : ""}>
+                        <td>
+                          <button className="job-title-button" type="button" onClick={() => handleSelectJob(job)}>
+                            <strong>{job.title}</strong>
+                            <span>{job.job_id}</span>
+                          </button>
+                        </td>
+                        <td><TableValue value={job.department} /></td>
+                        <td><TableValue value={job.location} /></td>
+                        <td>{formatMetric(job.applicants)}</td>
+                        <td>
+                          <span className={`match-badge ${Number(job.top_match_percentage) >= 70 ? "is-strong" : ""}`}>
+                            {formatPercent(job.top_match_percentage)}
+                          </span>
+                        </td>
+                        <td>
+                          <span className={`job-status-badge status-${String(job.status || "").replace(/\s+/g, "-")}`}>
+                            {formatLabel(job.status)}
+                          </span>
+                        </td>
+                        <td><TableValue value={job.created_at} /></td>
+                        <td>
+                          <div className="row-actions">
+                            <button className="view-button" type="button" onClick={() => handleSelectJob(job)}>
+                              View
+                            </button>
+                            {isAdmin && (
+                              <button className="delete-button" type="button" onClick={() => handleDeleteJob(job)}>
+                                Delete
+                              </button>
+                            )}
+                          </div>
+                        </td>
+                      </tr>
+                    ))
+                  )}
+                </tbody>
+              </table>
+            </div>
+
+            <div className="table-footer">
+              <div className="table-summary">
+                {visibleJobs.length === 0
+                  ? "Showing 0 jobs"
+                  : `Showing ${jobStart}-${jobEnd} of ${visibleJobs.length} jobs`}
+              </div>
+
+              <div className="pagination-controls">
+                <button
+                  className="pagination-button"
+                  type="button"
+                  onClick={() => setCurrentJobPage((page) => Math.max(page - 1, 1))}
+                  disabled={currentJobPage === 1}
+                  aria-label="Previous job page"
+                >
+                  <ChevronLeftIcon />
+                </button>
+                <span className="pagination-status">
+                  Page {currentJobPage} of {totalJobPages}
+                </span>
+                <button
+                  className="pagination-button"
+                  type="button"
+                  onClick={() => setCurrentJobPage((page) => Math.min(page + 1, totalJobPages))}
+                  disabled={currentJobPage === totalJobPages}
+                  aria-label="Next job page"
+                >
+                  <ChevronRightIcon />
+                </button>
+              </div>
+            </div>
+          </section>
+
+          <aside className="job-detail-panel">
+            {selectedJob ? (
+              <>
+                <div className="job-detail-header">
+                  <div>
+                    <span>{selectedJob.job_id}</span>
+                    <h2>{selectedJob.title}</h2>
+                    <p>{[selectedJob.department, selectedJob.location, selectedJob.job_type].filter(Boolean).join(" - ")}</p>
+                  </div>
+                  <span className={`job-status-badge status-${String(selectedJob.status || "").replace(/\s+/g, "-")}`}>
+                    {formatLabel(selectedJob.status)}
+                  </span>
+                </div>
+
+                <div className="job-detail-meta">
+                  <span>Last modified by {formatValue(selectedJob.updated_by || selectedJob.created_by)}</span>
+                  <span>{formatValue(selectedJob.updated_at || selectedJob.created_at)}</span>
+                </div>
+
+                <p className="job-description">
+                  {selectedJob.description || "No job description has been added yet."}
+                </p>
+
+                <div className="skill-tag-list">
+                  {(selectedJob.required_skills_list || []).length === 0 ? (
+                    <span className="skill-tag is-muted">No required skills listed</span>
+                  ) : (
+                    selectedJob.required_skills_list.map((skill) => (
+                      <span className="skill-tag" key={skill}>{skill}</span>
+                    ))
+                  )}
+                </div>
+
+                <div className="job-match-tabs" role="tablist" aria-label="Candidate matches">
+                  <button
+                    type="button"
+                    className={jobMatchTab === "top" ? "is-active" : ""}
+                    onClick={() => setJobMatchTab("top")}
+                  >
+                    Top Matches
+                  </button>
+                  <button
+                    type="button"
+                    className={jobMatchTab === "all" ? "is-active" : ""}
+                    onClick={() => setJobMatchTab("all")}
+                  >
+                    All Matches
+                  </button>
+                </div>
+
+                <div className="match-card-list">
+                  {isLoadingJobMatches ? (
+                    <p className="empty-state">Loading candidate matches...</p>
+                  ) : selectedJobMatches.length === 0 ? (
+                    <p className="empty-state">No candidate matches found for this job.</p>
+                  ) : (
+                    selectedJobMatches.map((match) => (
+                      <article className="match-card" key={match.candidate_id}>
+                        <div className="match-card-head">
+                          <div className="match-ring" style={{ "--match": Number(match.match_percentage) }}>
+                            <span>{formatPercent(match.match_percentage)}</span>
+                          </div>
+                          <div>
+                            <h3>{formatValue(match.candidate_name)}</h3>
+                            <p>{formatValue(match.current_position)}</p>
+                          </div>
+                        </div>
+
+                        <div className="match-card-meta">
+                          <span>{formatValue(match.location)}</span>
+                          <span>{formatYears(match.years_experience)} years</span>
+                        </div>
+
+                        <div className="match-skill-group">
+                          <span>Matched skills</span>
+                          <div className="skill-tag-list">
+                            {match.matched_skills.length ? (
+                              match.matched_skills.map((skill) => (
+                                <span className="skill-tag" key={skill}>{skill}</span>
+                              ))
+                            ) : (
+                              <span className="skill-tag is-muted">No skill overlap</span>
+                            )}
+                          </div>
+                        </div>
+
+                        {match.missing_skills.length > 0 && (
+                          <div className="match-skill-group">
+                            <span>Missing skills</span>
+                            <div className="skill-tag-list">
+                              {match.missing_skills.slice(0, 5).map((skill) => (
+                                <span className="skill-tag is-missing" key={skill}>{skill}</span>
+                              ))}
+                            </div>
+                          </div>
+                        )}
+
+                        <button
+                          className="secondary-button"
+                          type="button"
+                          onClick={() => handleViewCandidate({ id: match.candidate_id })}
+                        >
+                          View Profile
+                        </button>
+                      </article>
+                    ))
+                  )}
+                </div>
+              </>
+            ) : (
+              <p className="empty-state">Select a job to view candidate matches.</p>
+            )}
+          </aside>
+        </div>
+      </section>
+    );
+  };
+
   const renderSecurityDashboardPage = () => {
     const summary = securityDashboard.summary || emptySecurityDashboard.summary;
     const securityCards = [
@@ -2028,7 +2895,6 @@ function App() {
         </header>
 
         {securityDashboardError && <p className="error-message">{securityDashboardError}</p>}
-        {auditLogError && <p className="error-message">{auditLogError}</p>}
 
         <div className="metric-grid">
           {securityCards.map((card) => (
@@ -2036,211 +2902,10 @@ function App() {
           ))}
         </div>
 
-        <section className="surface-block">
-          <div className="surface-header">
-            <div>
-              <h2>Recent Activity</h2>
-              <p className="subtitle">Events sourced from the existing audit log.</p>
-            </div>
-          </div>
-
-          <div className="table-shell">
-            <table className="data-table security-table">
-              <thead>
-                <tr>
-                  <th>Time</th>
-                  <th>User</th>
-                  <th>Action</th>
-                  <th>Details</th>
-                  <th>Status</th>
-                </tr>
-              </thead>
-              <tbody>
-                {securityDashboard.recent_activity.length === 0 ? (
-                  <tr>
-                    <td className="empty-state" colSpan="5">
-                      No security activity recorded yet.
-                    </td>
-                  </tr>
-                ) : (
-                  securityDashboard.recent_activity.map((item) => (
-                    <tr key={item.id}>
-                      <td>
-                        <TableValue value={item.timestamp} />
-                      </td>
-                      <td>
-                        <TableValue value={item.user_email} />
-                      </td>
-                      <td>
-                        <TableValue value={item.action} />
-                      </td>
-                      <td>
-                        <TableValue value={formatAuditDetails(item.details)} />
-                      </td>
-                      <td>
-                        <span className={`status-pill status-${getAuditStatus(item.status)}`}>
-                          {String(item.status || "").toUpperCase()}
-                        </span>
-                      </td>
-                    </tr>
-                  ))
-                )}
-              </tbody>
-            </table>
-          </div>
-        </section>
-
-        <section className="surface-block">
-          <div className="surface-header">
-            <div>
-              <h2>Audit Logs</h2>
-              <p className="subtitle">
-                Search, filter, and review the full audit trail without leaving Security Dashboard.
-              </p>
-            </div>
-          </div>
-
-          <div className="audit-filters">
-            <label className="audit-filter audit-search-field">
-              <span>Search logs</span>
-              <input
-                type="search"
-                value={auditFilters.query}
-                onChange={(event) => updateAuditFilter("query", event.target.value)}
-                placeholder="Search user, action, details, or status..."
-              />
-            </label>
-
-            <label className="audit-filter">
-              <span>Action</span>
-              <select
-                value={auditFilters.action}
-                onChange={(event) => updateAuditFilter("action", event.target.value)}
-              >
-                {auditActionOptions.map((action) => (
-                  <option key={action} value={action}>
-                    {action}
-                  </option>
-                ))}
-              </select>
-            </label>
-
-            <label className="audit-filter">
-              <span>Status</span>
-              <select
-                value={auditFilters.status}
-                onChange={(event) => updateAuditFilter("status", event.target.value)}
-              >
-                {auditStatusOptions.map((status) => (
-                  <option key={status} value={status}>
-                    {status}
-                  </option>
-                ))}
-              </select>
-            </label>
-
-            <label className="audit-filter">
-              <span>Start Date</span>
-              <input
-                type="date"
-                value={auditFilters.startDate}
-                onChange={(event) => updateAuditFilter("startDate", event.target.value)}
-              />
-            </label>
-
-            <label className="audit-filter">
-              <span>End Date</span>
-              <input
-                type="date"
-                value={auditFilters.endDate}
-                onChange={(event) => updateAuditFilter("endDate", event.target.value)}
-              />
-            </label>
-
-            <button
-              className="secondary-button clear-filters-button"
-              type="button"
-              onClick={clearAuditFilters}
-              disabled={!hasAuditFilters}
-            >
-              Clear Filters
-            </button>
-          </div>
-
-          <div className="table-shell">
-            <table className="data-table audit-table">
-              <thead>
-                <tr>
-                  <th>Time</th>
-                  <th>User</th>
-                  <th>Action</th>
-                  <th>Details</th>
-                  <th>Status</th>
-                </tr>
-              </thead>
-              <tbody>
-                {auditLogs.length === 0 ? (
-                  <tr>
-                    <td className="empty-state" colSpan="5">
-                      {isLoadingAuditLogs ? "Loading audit logs..." : "No audit logs recorded yet."}
-                    </td>
-                  </tr>
-                ) : visibleAuditLogs.length === 0 ? (
-                  <tr>
-                    <td className="empty-state" colSpan="5">
-                      No audit logs match your filters.
-                    </td>
-                  </tr>
-                ) : (
-                  visibleAuditLogs.map((log) => (
-                    <tr key={log.id}>
-                      <td>
-                        <TableValue value={log.timestamp} />
-                      </td>
-                      <td>
-                        <TableValue value={log.user_email} />
-                      </td>
-                      <td>
-                        <TableValue value={log.action} />
-                      </td>
-                      <td>
-                        <TableValue value={formatAuditDetails(log.details)} />
-                      </td>
-                      <td>
-                        <span className={`status-pill status-${getAuditStatus(log.status)}`}>
-                          {String(log.status || "").toUpperCase()}
-                        </span>
-                      </td>
-                    </tr>
-                  ))
-                )}
-              </tbody>
-            </table>
-          </div>
-        </section>
+        {renderAuditLogsSection()}
       </section>
     );
   };
-
-  const renderPlaceholderPage = (title, subtitle) => (
-    <section className="page-stack">
-      <header className="page-header">
-        <div>
-          <p className="section-kicker">Workspace</p>
-          <h1>{title}</h1>
-          <p className="subtitle">{subtitle}</p>
-        </div>
-      </header>
-
-      <section className="surface-block placeholder-block">
-        <h2>{title} is ready for your next integration.</h2>
-        <p className="subtitle">
-          This view is intentionally lightweight for now so the navigation stays intact without
-          changing backend behavior.
-        </p>
-      </section>
-    </section>
-  );
 
   if (isCheckingAuth) {
     return (
@@ -2302,10 +2967,7 @@ function App() {
     candidates: renderCandidatesPage(),
     upload: renderUploadPage(),
     analytics: renderAnalyticsPage(),
-    jobBoard: renderPlaceholderPage(
-      "Job Board",
-      "Track live requisitions, open headcount, and placement priorities.",
-    ),
+    jobBoard: renderJobBoardPage(),
     securityDashboard: renderSecurityDashboardPage(),
     users: renderUsersPage(),
   };
@@ -2459,6 +3121,127 @@ function App() {
                 </dl>
               </section>
             </div>
+          </section>
+        </div>
+      )}
+
+      {isJobModalOpen && (
+        <div className="modal-overlay" onClick={closeJobModal}>
+          <section
+            className="details-modal job-modal"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="job-modal-title"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <header className="modal-header">
+              <div>
+                <h2 id="job-modal-title">Create Job Requisition</h2>
+                <p>Add a requisition for candidate matching and recruiting coverage.</p>
+              </div>
+
+              <button className="modal-close" type="button" onClick={closeJobModal}>
+                Close
+              </button>
+            </header>
+
+            <form className="user-form" onSubmit={handleCreateJob}>
+              {jobActionMessage && <p className="error-message">{jobActionMessage}</p>}
+
+              <div className="user-form-grid">
+                <label className="audit-filter">
+                  <span>Title</span>
+                  <input
+                    type="text"
+                    value={jobForm.title}
+                    onChange={(event) => setJobForm((currentForm) => ({ ...currentForm, title: event.target.value }))}
+                    required
+                  />
+                </label>
+
+                <label className="audit-filter">
+                  <span>Department</span>
+                  <input
+                    type="text"
+                    value={jobForm.department}
+                    onChange={(event) => setJobForm((currentForm) => ({ ...currentForm, department: event.target.value }))}
+                  />
+                </label>
+
+                <label className="audit-filter">
+                  <span>Location</span>
+                  <input
+                    type="text"
+                    value={jobForm.location}
+                    onChange={(event) => setJobForm((currentForm) => ({ ...currentForm, location: event.target.value }))}
+                  />
+                </label>
+
+                <label className="audit-filter">
+                  <span>Job Type</span>
+                  <select
+                    value={jobForm.job_type}
+                    onChange={(event) => setJobForm((currentForm) => ({ ...currentForm, job_type: event.target.value }))}
+                  >
+                    {jobTypeOptions.map((jobType) => (
+                      <option key={jobType}>{jobType}</option>
+                    ))}
+                  </select>
+                </label>
+
+                <label className="audit-filter">
+                  <span>Status</span>
+                  <select
+                    value={jobForm.status}
+                    onChange={(event) => setJobForm((currentForm) => ({ ...currentForm, status: event.target.value }))}
+                  >
+                    {jobStatusOptions.map((status) => (
+                      <option key={status} value={status}>
+                        {formatLabel(status)}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+
+                <label className="audit-filter">
+                  <span>Salary</span>
+                  <input
+                    type="text"
+                    value={jobForm.salary}
+                    onChange={(event) => setJobForm((currentForm) => ({ ...currentForm, salary: event.target.value }))}
+                    placeholder="Optional"
+                  />
+                </label>
+              </div>
+
+              <label className="audit-filter">
+                <span>Required Skills</span>
+                <input
+                  type="text"
+                  value={jobForm.required_skills}
+                  onChange={(event) => setJobForm((currentForm) => ({ ...currentForm, required_skills: event.target.value }))}
+                  placeholder="Python, FastAPI, React"
+                />
+              </label>
+
+              <label className="audit-filter">
+                <span>Job Description</span>
+                <textarea
+                  value={jobForm.description}
+                  onChange={(event) => setJobForm((currentForm) => ({ ...currentForm, description: event.target.value }))}
+                  rows="5"
+                />
+              </label>
+
+              <div className="modal-actions">
+                <button className="secondary-button" type="button" onClick={closeJobModal}>
+                  Cancel
+                </button>
+                <button className="primary-button" type="submit" disabled={isSavingJob}>
+                  {isSavingJob ? "Saving..." : "Save Job"}
+                </button>
+              </div>
+            </form>
           </section>
         </div>
       )}
