@@ -1,5 +1,7 @@
 import json
 import re
+import sqlite3
+from pathlib import Path
 from urllib.parse import urljoin, urlparse
 
 import requests
@@ -8,6 +10,8 @@ from bs4 import BeautifulSoup
 START_URL = "https://atlanticrecruiters.com/job-postings/"
 BASE_URL = "https://atlanticrecruiters.com"
 TEST_LIMIT = 5
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+DB_PATH = PROJECT_ROOT / "database" / "resumeai.db"
 IGNORED_LINK_TEXTS = {
     "home",
     "jobs",
@@ -42,6 +46,32 @@ def text_matches_link(text: str) -> bool:
     return cleaned_text(text).lower() in IGNORED_LINK_TEXTS
 
 
+def extract_field(pattern: str, text: str) -> str:
+    match = re.search(pattern, text, re.I | re.S)
+    if not match:
+        return ""
+    return cleaned_text(match.group(1))
+
+
+def ensure_scraped_jobs_table() -> None:
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS scraped_jobs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                title TEXT,
+                url TEXT NOT NULL UNIQUE,
+                location TEXT,
+                department TEXT,
+                employment_type TEXT,
+                job_number TEXT,
+                salary TEXT,
+                description TEXT,
+                active INTEGER NOT NULL DEFAULT 1,
+                last_scraped TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+
 def find_listing_links(soup: BeautifulSoup) -> list[str]:
     # The page contains navigation links plus real job links. We only keep the latter.
     job_urls: list[str] = []
@@ -68,67 +98,6 @@ def find_listing_links(soup: BeautifulSoup) -> list[str]:
         job_urls.append(full_url)
 
     return job_urls
-
-
-def collect_text_after_label(soup: BeautifulSoup, labels: list[str]) -> str:
-    # Atlantic job pages expose some fields as visible labels in the page body.
-    for label in labels:
-        label_node = soup.find(string=re.compile(rf"^{re.escape(label)}$", re.I))
-        if not label_node:
-            continue
-
-        parent_text = label_node.parent.get_text(" ", strip=True)
-        if ":" in parent_text:
-            candidate = parent_text.split(":", 1)[1].strip()
-            if candidate and candidate.lower() != label.lower():
-                return candidate
-
-        next_text = label_node.parent.find_next(string=True)
-        if next_text:
-            candidate = cleaned_text(str(next_text))
-            if candidate and candidate.lower() != label.lower():
-                return candidate
-
-    return ""
-
-
-def extract_field_from_text(text: str, label_patterns: list[str]) -> str:
-    # Search the cleaned page text for lines like "Location: Boston, MA".
-    lines = [cleaned_text(line) for line in text.splitlines()]
-    for line in lines:
-        if not line:
-            continue
-        for label_pattern in label_patterns:
-            match = re.match(label_pattern, line, re.I)
-            if match:
-                value = match.group(1).strip()
-                return value
-    return ""
-
-
-def extract_field(pattern: str, text: str) -> str:
-    match = re.search(pattern, text, re.I | re.S)
-    if not match:
-        return ""
-    return cleaned_text(match.group(1))
-
-
-def extract_field_from_block(text: str, label: str, next_label_candidates: list[str]) -> str:
-    # Handle cases where the field is followed by another label on the next line.
-    pattern = re.compile(rf"{re.escape(label)}\s*:\s*(.+)", re.I)
-    for match in pattern.finditer(text):
-        value = cleaned_text(match.group(1))
-        if not value:
-            continue
-
-        lower_value = value.lower()
-        for next_label in next_label_candidates:
-            next_lower = next_label.lower() + ":"
-            if next_lower in lower_value:
-                value = cleaned_text(value.split(next_label, 1)[0])
-                break
-        return value
-    return ""
 
 
 def parse_json_ld_jobposting(soup: BeautifulSoup) -> dict:
@@ -180,17 +149,11 @@ def parse_json_ld_jobposting(soup: BeautifulSoup) -> dict:
             return {
                 "location": location,
                 "employment_type": employment_type,
-                "department": "",
-                "job_number": "",
-                "salary": "",
             }
 
     return {
         "location": "",
         "employment_type": "",
-        "department": "",
-        "job_number": "",
-        "salary": "",
     }
 
 
@@ -206,31 +169,16 @@ def extract_job_details(job_url: str) -> dict[str, str]:
         title = cleaned_text(og_title.get("content", "")) if og_title else ""
 
     details = parse_json_ld_jobposting(soup)
-
-    if not details["location"]:
-        details["location"] = collect_text_after_label(soup, ["Location", "Job Location"])
-    if not details["employment_type"]:
-        details["employment_type"] = collect_text_after_label(
-            soup,
-            ["Employment Type", "Job Type", "Type"],
-        )
-    details["department"] = collect_text_after_label(
-        soup,
-        ["Department", "Category", "Division"],
-    )
-
     content_root = soup.find("main") or soup.find("article") or soup.body
-    description = cleaned_text(content_root.get_text(" ", strip=True)) if content_root else ""
-    description_text = content_root.get_text("\n", strip=True) if content_root else ""
-    description_preview = description[:500]
-    cleaned_job_text = description
+    cleaned_job_text = cleaned_text(content_root.get_text(" ", strip=True)) if content_root else ""
+    description = cleaned_job_text
 
     # Debug the exact text the regex sees before we parse it.
     print("DEBUG CLEANED JOB TEXT (first 1000 chars):")
     print(cleaned_job_text[:1000])
     print("END DEBUG")
 
-    # Parse the same cleaned text that we print above.
+    # Parse the same cleaned text that is printed above.
     location = extract_field(r"Location:\s*(.*?)(?=\s+Type:)", cleaned_job_text)
     employment_type = extract_field(r"Type:\s*(.*?)(?=\s+Job\s+#)", cleaned_job_text)
     job_number = extract_field(r"Job\s+#\s*(\d+)", cleaned_job_text)
@@ -240,46 +188,123 @@ def extract_job_details(job_url: str) -> dict[str, str]:
         details["location"] = location
     if not details["employment_type"]:
         details["employment_type"] = employment_type
-    if not details["department"]:
-        details["department"] = collect_text_after_label(
-            soup,
-            ["Department", "Category", "Division"],
-        )
-    if not job_number:
-        job_number = extract_field(r"Job\s+#\s*(\d+)", description_text)
-    if not salary:
-        salary = extract_field(r"Salary:\s*(.*?)(?=\s+Job Overview)", description_text)
+
+    department = extract_field(r"Department:\s*(.*?)(?=\s+(?:Location|Type|Job\s+#|Salary|Job Overview))", cleaned_job_text)
 
     return {
         "title": title,
         "url": job_url,
         "location": details["location"],
-        "department": details["department"],
+        "department": department,
         "employment_type": details["employment_type"],
         "job_number": job_number,
         "salary": salary,
-        "description_preview": description_preview,
+        "description": description,
     }
 
 
+def save_scraped_job(job: dict[str, str]) -> str:
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT id
+            FROM scraped_jobs
+            WHERE url = ?
+        """, (job["url"],))
+        existing = cursor.fetchone()
+
+        if existing:
+            cursor.execute("""
+                UPDATE scraped_jobs
+                SET title = ?,
+                    location = ?,
+                    department = ?,
+                    employment_type = ?,
+                    job_number = ?,
+                    salary = ?,
+                    description = ?,
+                    active = 1,
+                    last_scraped = CURRENT_TIMESTAMP
+                WHERE url = ?
+            """, (
+                job["title"],
+                job["location"],
+                job["department"],
+                job["employment_type"],
+                job["job_number"],
+                job["salary"],
+                job["description"],
+                job["url"],
+            ))
+            return "updated"
+
+        cursor.execute("""
+            INSERT INTO scraped_jobs (
+                title,
+                url,
+                location,
+                department,
+                employment_type,
+                job_number,
+                salary,
+                description,
+                active,
+                last_scraped
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, CURRENT_TIMESTAMP)
+        """, (
+            job["title"],
+            job["url"],
+            job["location"],
+            job["department"],
+            job["employment_type"],
+            job["job_number"],
+            job["salary"],
+            job["description"],
+        ))
+        return "inserted"
+
+
 def main() -> None:
+    ensure_scraped_jobs_table()
+
     listing_soup = get_soup(START_URL)
-    job_urls = find_listing_links(listing_soup)
-    job_urls = job_urls[:TEST_LIMIT]
+    job_urls = find_listing_links(listing_soup)[:TEST_LIMIT]
+
+    jobs_found = len(job_urls)
+    jobs_inserted = 0
+    jobs_updated = 0
+    jobs_skipped_errors = 0
 
     total_jobs = len(job_urls)
     for index, job_url in enumerate(job_urls, start=1):
         print(f"Scraping job {index} of {total_jobs}")
-        details = extract_job_details(job_url)
-        print("Job Title:", details["title"])
-        print("Job URL:", details["url"])
-        print("Location:", details["location"] or "Not found")
-        print("Department:", details["department"] or "Not found")
-        print("Employment Type:", details["employment_type"] or "Not found")
-        print("Job Number:", details["job_number"] or "Not found")
-        print("Salary:", details["salary"] or "Not found")
-        print("Description Preview:", details["description_preview"])
-        print("-" * 60)
+        try:
+            details = extract_job_details(job_url)
+            save_result = save_scraped_job(details)
+            if save_result == "inserted":
+                jobs_inserted += 1
+            elif save_result == "updated":
+                jobs_updated += 1
+
+            print("Job Title:", details["title"])
+            print("Job URL:", details["url"])
+            print("Location:", details["location"] or "Not found")
+            print("Department:", details["department"] or "Not found")
+            print("Employment Type:", details["employment_type"] or "Not found")
+            print("Job Number:", details["job_number"] or "Not found")
+            print("Salary:", details["salary"] or "Not found")
+            print("Description Preview:", details["description"][:500])
+            print("-" * 60)
+        except Exception as exc:
+            jobs_skipped_errors += 1
+            print(f"Error scraping {job_url}: {exc}")
+
+    print("Summary:")
+    print(f"jobs found: {jobs_found}")
+    print(f"jobs inserted: {jobs_inserted}")
+    print(f"jobs updated: {jobs_updated}")
+    print(f"jobs skipped/errors: {jobs_skipped_errors}")
 
 
 if __name__ == "__main__":
