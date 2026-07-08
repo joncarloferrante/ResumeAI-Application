@@ -5,6 +5,7 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import shutil
 import sqlite3
 import time
@@ -16,6 +17,7 @@ from resume_parser import parse_resume_file
 from database import (
     create_audit_log,
     create_user,
+    calculate_job_match,
     delete_candidate,
     delete_user_record,
     get_security_dashboard_data,
@@ -24,6 +26,7 @@ from database import (
     get_audit_logs,
     get_candidate_by_id,
     get_dashboard_analytics,
+    get_connection,
     get_user_by_email,
     get_user_by_id,
     mark_user_login,
@@ -672,3 +675,89 @@ def list_audit_logs(current_user: dict = Depends(get_current_user)):
 
     create_audit_log(current_user["email"], "Audit Logs View", "Viewed audit logs.", "success")
     return get_audit_logs()
+
+
+@app.get("/api/scraped-jobs")
+def list_scraped_jobs():
+    with get_connection() as conn:
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT
+                id,
+                title,
+                location,
+                department,
+                employment_type,
+                job_number,
+                salary,
+                description,
+                url,
+                active,
+                last_scraped
+            FROM scraped_jobs
+            WHERE COALESCE(active, 1) = 1
+            ORDER BY id DESC
+        """)
+        rows = [dict(row) for row in cursor.fetchall()]
+
+    return {"jobs": rows}
+
+
+@app.get("/api/scraped-jobs/{job_id}/matches")
+def list_scraped_job_matches(job_id: int):
+    with get_connection() as conn:
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+
+        cursor.execute("""
+            SELECT id, title, department, location, employment_type, job_number, salary, description, url, active, last_scraped
+            FROM scraped_jobs
+            WHERE id = ?
+        """, (job_id,))
+        job_row = cursor.fetchone()
+
+    if not job_row:
+        raise HTTPException(status_code=404, detail="Scraped job not found")
+
+    scraped_job = dict(job_row)
+    candidates = get_candidates()
+    if not candidates:
+        return {
+            "job": scraped_job,
+            "matches": [],
+            "total_resumes": 0,
+            "strong_matches": [],
+        }
+
+    # Reuse the existing match calculator by turning the scraped job title and department into a keyword list.
+    required_skills = ", ".join(
+        dict.fromkeys(
+            part
+            for part in re.split(r"[\s,/|-]+", f"{scraped_job.get('title', '')} {scraped_job.get('department', '')}")
+            if part and len(part) > 2
+        )
+    )
+    synthetic_job = {
+        "id": scraped_job["id"],
+        "title": scraped_job["title"],
+        "department": scraped_job.get("department", ""),
+        "location": scraped_job.get("location", ""),
+        "job_type": scraped_job.get("employment_type", ""),
+        "status": "open" if scraped_job.get("active", 1) else "closed",
+        "description": scraped_job.get("description", ""),
+        "required_skills": required_skills,
+        "salary": scraped_job.get("salary", ""),
+    }
+
+    matches = [calculate_job_match(synthetic_job, candidate) for candidate in candidates]
+    matches.sort(key=lambda match: int(match["match_percentage"] or 0), reverse=True)
+
+    strong_matches = [match for match in matches if int(match["match_percentage"] or 0) >= 75]
+
+    return {
+        "job": scraped_job,
+        "matches": matches,
+        "total_resumes": len(candidates),
+        "strong_matches": strong_matches,
+    }

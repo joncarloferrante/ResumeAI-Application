@@ -234,6 +234,114 @@ function formatRefreshTimestamp(date) {
   return `Last Refresh ${month}/${day}/${year} ${hours12}:${minutes} ${meridiem}`;
 }
 
+function formatDate(value) {
+  if (!value) {
+    return "N/A";
+  }
+
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    return "N/A";
+  }
+
+  return date.toLocaleString(undefined, {
+    year: "numeric",
+    month: "short",
+    day: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+  });
+}
+
+function formatSalary(value) {
+  const text = String(value ?? "").trim();
+  return text ? text : "N/A";
+}
+
+function cleanJobText(value) {
+  return String(value ?? "")
+    .replace(/\r\n/g, "\n")
+    .replace(/\u00a0/g, " ")
+    .replace(/[ \t]+\n/g, "\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .replace(/(?:Your Name|Email Address|Phone Number|Upload Resume|Attach a resume file|Footer|Submit Application)\b[\s\S]*$/i, "")
+    .trim();
+}
+
+function splitJobDescription(description) {
+  const cleanedDescription = cleanJobText(description);
+  if (!cleanedDescription) {
+    return {
+      overview: [],
+      responsibilities: [],
+      qualifications: [],
+      applicationNotice: [],
+    };
+  }
+
+  const sectionMatchers = [
+    { key: "overview", label: "Job Overview" },
+    { key: "responsibilities", label: "Responsibilities" },
+    { key: "qualifications", label: "Qualifications" },
+    { key: "applicationNotice", label: "Application Notice" },
+  ];
+
+  const normalizedText = cleanedDescription.replace(/\r\n/g, "\n");
+  const sectionMap = sectionMatchers.reduce((accumulator, section) => {
+    accumulator[section.key] = [];
+    return accumulator;
+  }, {});
+
+  const headingPatterns = [
+    { key: "overview", pattern: /job overview\s*[-:–—]?\s*/gi },
+    { key: "responsibilities", pattern: /responsibilities(?:\s+as)?\s*(?:the|a|an)?[^:\n]*:\s*/gi },
+    { key: "qualifications", pattern: /qualifications(?:\s+for)?\s*(?:the|a|an)?[^:\n]*:\s*/gi },
+    { key: "applicationNotice", pattern: /application notice\s*:\s*/gi },
+  ];
+
+  const matches = headingPatterns
+    .flatMap((section) => {
+      const sectionMatches = [];
+      let match;
+      while ((match = section.pattern.exec(normalizedText)) !== null) {
+        sectionMatches.push({
+          key: section.key,
+          index: match.index,
+          length: match[0].length,
+        });
+      }
+      return sectionMatches;
+    })
+    .sort((firstMatch, secondMatch) => firstMatch.index - secondMatch.index);
+
+  if (matches.length === 0) {
+    return {
+      overview: [cleanedDescription],
+      responsibilities: [],
+      qualifications: [],
+      applicationNotice: [],
+    };
+  }
+
+  matches.forEach((match, index) => {
+    const startIndex = match.index + match.length;
+    const endIndex = index + 1 < matches.length ? matches[index + 1].index : normalizedText.length;
+    const sectionText = cleanJobText(normalizedText.slice(startIndex, endIndex));
+    if (sectionText) {
+      sectionMap[match.key].push(sectionText);
+    }
+  });
+
+  return sectionMap;
+}
+
+function toTextParagraphs(value) {
+  return cleanJobText(value)
+    .split(/\n{2,}/)
+    .map((paragraph) => paragraph.trim())
+    .filter(Boolean);
+}
+
 function getUploadFileExtension(file) {
   return String(file?.name || "")
     .split(".")
@@ -505,6 +613,7 @@ function App() {
   const [jobMatches, setJobMatches] = useState([]);
   const [isLoadingJobMatches, setIsLoadingJobMatches] = useState(false);
   const [jobMatchTab, setJobMatchTab] = useState("top");
+  const [isJobDetailsModalOpen, setIsJobDetailsModalOpen] = useState(false);
   const [isJobModalOpen, setIsJobModalOpen] = useState(false);
   const [jobForm, setJobForm] = useState(emptyJobForm);
   const [isSavingJob, setIsSavingJob] = useState(false);
@@ -743,7 +852,17 @@ function App() {
     return jobs.filter((job) => {
       const matchesQuery =
         !normalizedQuery ||
-        [job.title, job.job_id, job.department, job.location, job.required_skills, job.description].some((value) =>
+        [
+          job.title,
+          job.job_id,
+          job.department,
+          job.location,
+          job.job_type,
+          job.employment_type,
+          job.job_number,
+          job.salary,
+          job.description,
+        ].some((value) =>
           String(value ?? "")
             .toLowerCase()
             .includes(normalizedQuery),
@@ -770,7 +889,7 @@ function App() {
     [jobs],
   );
   const availableJobTypes = useMemo(
-    () => Array.from(new Set([...jobTypeOptions, ...jobs.map((job) => job.job_type).filter(Boolean)])),
+    () => Array.from(new Set([...jobTypeOptions, ...jobs.map((job) => job.job_type || job.employment_type).filter(Boolean)])),
     [jobs],
   );
   const jobsPerPage = 8;
@@ -781,9 +900,14 @@ function App() {
   }, [currentJobPage, visibleJobs]);
   const jobStart = visibleJobs.length === 0 ? 0 : (currentJobPage - 1) * jobsPerPage + 1;
   const jobEnd = Math.min(currentJobPage * jobsPerPage, visibleJobs.length);
-  const selectedJobMatches = jobMatchTab === "top"
-    ? jobMatches.filter((match) => Number(match.match_percentage) >= 70)
-    : jobMatches;
+  const selectedJobMatches = [...jobMatches].sort(
+    (firstMatch, secondMatch) => Number(secondMatch.match_percentage || 0) - Number(firstMatch.match_percentage || 0),
+  );
+  const strongJobMatches = selectedJobMatches.filter((match) => Number(match.match_percentage || 0) >= 75);
+  const otherJobMatches = selectedJobMatches.filter((match) => Number(match.match_percentage || 0) < 75);
+  const selectedJobDescriptionSections = splitJobDescription(
+    selectedJob?.full_description || selectedJob?.description || selectedJob?.job_description || "",
+  );
 
   const handleUserRoleChange = async (targetUser, nextRole) => {
     if (!targetUser || targetUser.role === nextRole) {
@@ -929,20 +1053,20 @@ function App() {
     setJobBoardError("");
 
     try {
-      const response = await api.get("/jobs");
-      const nextJobBoard = response.data || emptyJobBoard;
-      const nextJobs = nextJobBoard.jobs || [];
+      const response = await api.get("/api/scraped-jobs");
+      const nextJobs = (response.data?.jobs || []).map((job) => ({
+        ...job,
+        job_id: job.job_number,
+        department: job.department || job.employment_type || "",
+        job_type: job.employment_type || "",
+        status: job.active ? "open" : "closed",
+        created_at: job.last_scraped,
+      }));
       setJobBoard({
         jobs: nextJobs,
-        summary: nextJobBoard.summary || emptyJobBoard.summary,
+        summary: emptyJobBoard.summary,
       });
-      setSelectedJob((currentJob) => {
-        if (!currentJob) {
-          return nextJobs[0] || null;
-        }
-
-        return nextJobs.find((job) => job.id === currentJob.id) || nextJobs[0] || null;
-      });
+      setSelectedJob(null);
       return true;
     } catch (error) {
       console.error(error);
@@ -967,7 +1091,7 @@ function App() {
     setIsLoadingJobMatches(true);
 
     try {
-      const response = await api.get(`/jobs/${job.id}/matches`);
+      const response = await api.get(`/api/scraped-jobs/${job.id}/matches`);
       setJobMatches(response.data.matches || []);
       return true;
     } catch (error) {
@@ -1389,6 +1513,15 @@ function App() {
   const handleSelectJob = (job) => {
     setSelectedJob(job);
     setJobMatchTab("top");
+  };
+
+  const openJobDetailsModal = (job) => {
+    handleSelectJob(job);
+    setIsJobDetailsModalOpen(true);
+  };
+
+  const closeJobDetailsModal = () => {
+    setIsJobDetailsModalOpen(false);
   };
 
   const closeJobModal = () => {
@@ -2635,12 +2768,12 @@ function App() {
                 <thead>
                   <tr>
                     <th>Job Title</th>
-                    <th>Department</th>
                     <th>Location</th>
-                    <th>Applicants</th>
-                    <th>Top Match %</th>
-                    <th>Status</th>
-                    <th>Posted Date</th>
+                    <th>Employment Type</th>
+                    <th>Job Number</th>
+                    <th>Salary</th>
+                    <th>Active</th>
+                    <th>Last Scraped</th>
                     <th>Actions</th>
                   </tr>
                 </thead>
@@ -2648,7 +2781,7 @@ function App() {
                   {jobs.length === 0 ? (
                     <tr>
                       <td className="empty-state" colSpan="8">
-                        {isLoadingJobs ? "Loading jobs..." : "No job requisitions created yet."}
+                        {isLoadingJobs ? "Loading jobs..." : "No scraped jobs found yet."}
                       </td>
                     </tr>
                   ) : visibleJobs.length === 0 ? (
@@ -2659,38 +2792,26 @@ function App() {
                     </tr>
                   ) : (
                     paginatedJobs.map((job) => (
-                      <tr key={job.id} className={selectedJob?.id === job.id ? "is-selected-row" : ""}>
+                      <tr
+                        key={job.id}
+                        className={selectedJob?.id === job.id ? "is-selected-row" : ""}
+                        onClick={() => handleSelectJob(job)}
+                      >
                         <td>
                           <button className="job-title-button" type="button" onClick={() => handleSelectJob(job)}>
-                            <strong>{job.title}</strong>
-                            <span>{job.job_id}</span>
+                            <strong>{formatValue(job.title)}</strong>
                           </button>
                         </td>
-                        <td><TableValue value={job.department} /></td>
                         <td><TableValue value={job.location} /></td>
-                        <td>{formatMetric(job.applicants)}</td>
+                        <td><TableValue value={job.employment_type} /></td>
+                        <td><TableValue value={job.job_number} /></td>
+                        <td><TableValue value={job.salary} /></td>
+                        <td>{job.active ? "Yes" : "No"}</td>
+                        <td><TableValue value={job.last_scraped} /></td>
                         <td>
-                          <span className={`match-badge ${Number(job.top_match_percentage) >= 70 ? "is-strong" : ""}`}>
-                            {formatPercent(job.top_match_percentage)}
-                          </span>
-                        </td>
-                        <td>
-                          <span className={`job-status-badge status-${String(job.status || "").replace(/\s+/g, "-")}`}>
-                            {formatLabel(job.status)}
-                          </span>
-                        </td>
-                        <td><TableValue value={job.created_at} /></td>
-                        <td>
-                          <div className="row-actions">
-                            <button className="view-button" type="button" onClick={() => handleSelectJob(job)}>
-                              View
-                            </button>
-                            {isAdmin && (
-                              <button className="delete-button" type="button" onClick={() => handleDeleteJob(job)}>
-                                Delete
-                              </button>
-                            )}
-                          </div>
+                          <button className="view-button" type="button" onClick={() => openJobDetailsModal(job)}>
+                            View
+                          </button>
                         </td>
                       </tr>
                     ))
@@ -2735,111 +2856,207 @@ function App() {
           <aside className="job-detail-panel">
             {selectedJob ? (
               <>
+                <section className="detail-card">
+                  <div className="job-detail-header">
+                    <div>
+                      <span>Job Summary</span>
+                      <h2>{formatValue(selectedJob.title)}</h2>
+                      <p>{[selectedJob.location, selectedJob.employment_type, selectedJob.job_number].filter(Boolean).join(" - ")}</p>
+                    </div>
+                    <a
+                      className="primary-button"
+                      href={selectedJob.url}
+                      target="_blank"
+                      rel="noreferrer"
+                    >
+                      Open Original Job
+                    </a>
+                  </div>
+
+                  <div className="job-detail-meta">
+                    <span>Location: {formatValue(selectedJob.location)}</span>
+                    <span>Employment Type: {formatValue(selectedJob.employment_type || selectedJob.job_type)}</span>
+                    <span>Job Number: {formatValue(selectedJob.job_number || selectedJob.job_id)}</span>
+                    <span>Salary: {formatValue(selectedJob.salary)}</span>
+                  </div>
+
+                  <p className="job-description">
+                    {(selectedJob.description || "").slice(0, 500) || "No job description available."}
+                  </p>
+                </section>
+
                 <div className="job-detail-header">
                   <div>
-                    <span>{selectedJob.job_id}</span>
-                    <h2>{selectedJob.title}</h2>
-                    <p>{[selectedJob.department, selectedJob.location, selectedJob.job_type].filter(Boolean).join(" - ")}</p>
+                    <span>Candidate Matches</span>
+                    <h2>Best matching resumes</h2>
+                    <p>Sorted from highest percentage to lowest.</p>
                   </div>
-                  <span className={`job-status-badge status-${String(selectedJob.status || "").replace(/\s+/g, "-")}`}>
-                    {formatLabel(selectedJob.status)}
-                  </span>
                 </div>
 
-                <div className="job-detail-meta">
-                  <span>Last modified by {formatValue(selectedJob.updated_by || selectedJob.created_by)}</span>
-                  <span>{formatValue(selectedJob.updated_at || selectedJob.created_at)}</span>
-                </div>
+                {isLoadingJobMatches ? (
+                  <p className="empty-state">Loading candidate matches...</p>
+                ) : jobMatches.length === 0 ? (
+                  <p className="empty-state">No resumes have been uploaded.</p>
+                ) : strongJobMatches.length === 0 ? (
+                  <>
+                    <p className="empty-state">No strong matches found.</p>
+                    {otherJobMatches.length > 0 && (
+                      <details className="detail-card">
+                        <summary>Other Candidates</summary>
+                        <div className="match-card-list">
+                          {otherJobMatches.map((match) => {
+                            const score = Number(match.match_percentage) || 0;
+                            const matchClass = score >= 90 ? "is-strong" : score >= 75 ? "is-warning" : "is-danger";
 
-                <p className="job-description">
-                  {selectedJob.description || "No job description has been added yet."}
-                </p>
-
-                <div className="skill-tag-list">
-                  {(selectedJob.required_skills_list || []).length === 0 ? (
-                    <span className="skill-tag is-muted">No required skills listed</span>
-                  ) : (
-                    selectedJob.required_skills_list.map((skill) => (
-                      <span className="skill-tag" key={skill}>{skill}</span>
-                    ))
-                  )}
-                </div>
-
-                <div className="job-match-tabs" role="tablist" aria-label="Candidate matches">
-                  <button
-                    type="button"
-                    className={jobMatchTab === "top" ? "is-active" : ""}
-                    onClick={() => setJobMatchTab("top")}
-                  >
-                    Top Matches
-                  </button>
-                  <button
-                    type="button"
-                    className={jobMatchTab === "all" ? "is-active" : ""}
-                    onClick={() => setJobMatchTab("all")}
-                  >
-                    All Matches
-                  </button>
-                </div>
-
-                <div className="match-card-list">
-                  {isLoadingJobMatches ? (
-                    <p className="empty-state">Loading candidate matches...</p>
-                  ) : selectedJobMatches.length === 0 ? (
-                    <p className="empty-state">No candidate matches found for this job.</p>
-                  ) : (
-                    selectedJobMatches.map((match) => (
-                      <article className="match-card" key={match.candidate_id}>
-                        <div className="match-card-head">
-                          <div className="match-ring" style={{ "--match": Number(match.match_percentage) }}>
-                            <span>{formatPercent(match.match_percentage)}</span>
-                          </div>
-                          <div>
-                            <h3>{formatValue(match.candidate_name)}</h3>
-                            <p>{formatValue(match.current_position)}</p>
-                          </div>
+                            return (
+                              <article className="match-card" key={match.candidate_id}>
+                                <div className="match-card-head">
+                                  <div className={`match-ring ${matchClass}`} style={{ "--match": score }}>
+                                    <span>{formatPercent(score)}</span>
+                                  </div>
+                                  <div>
+                                    <h3>{formatValue(match.candidate_name)}</h3>
+                                    <p>{formatValue(match.current_position)}</p>
+                                  </div>
+                                </div>
+                                <div className="match-card-meta">
+                                  <span>{formatYears(match.years_experience)} years of experience</span>
+                                </div>
+                                <div className="match-skill-group">
+                                  <span>Skills Matched</span>
+                                  <div className="skill-tag-list">
+                                    {(match.matched_skills || []).length ? (
+                                      match.matched_skills.map((skill) => (
+                                        <span className="skill-tag" key={skill}>{skill}</span>
+                                      ))
+                                    ) : (
+                                      <span className="skill-tag is-muted">None</span>
+                                    )}
+                                  </div>
+                                </div>
+                                <div className="match-skill-group">
+                                  <span>Missing Skills</span>
+                                  <div className="skill-tag-list">
+                                    {(match.missing_skills || []).length ? (
+                                      match.missing_skills.map((skill) => (
+                                        <span className="skill-tag is-missing" key={skill}>{skill}</span>
+                                      ))
+                                    ) : (
+                                      <span className="skill-tag">None</span>
+                                    )}
+                                  </div>
+                                </div>
+                              </article>
+                            );
+                          })}
                         </div>
+                      </details>
+                    )}
+                  </>
+                ) : (
+                  <>
+                    <div className="match-card-list">
+                      {strongJobMatches.map((match) => {
+                        const score = Number(match.match_percentage) || 0;
+                        const matchClass = score >= 90 ? "is-strong" : score >= 75 ? "is-warning" : "is-danger";
 
-                        <div className="match-card-meta">
-                          <span>{formatValue(match.location)}</span>
-                          <span>{formatYears(match.years_experience)} years</span>
-                        </div>
-
-                        <div className="match-skill-group">
-                          <span>Matched skills</span>
-                          <div className="skill-tag-list">
-                            {match.matched_skills.length ? (
-                              match.matched_skills.map((skill) => (
-                                <span className="skill-tag" key={skill}>{skill}</span>
-                              ))
-                            ) : (
-                              <span className="skill-tag is-muted">No skill overlap</span>
-                            )}
-                          </div>
-                        </div>
-
-                        {match.missing_skills.length > 0 && (
-                          <div className="match-skill-group">
-                            <span>Missing skills</span>
-                            <div className="skill-tag-list">
-                              {match.missing_skills.slice(0, 5).map((skill) => (
-                                <span className="skill-tag is-missing" key={skill}>{skill}</span>
-                              ))}
+                        return (
+                          <article className="match-card" key={match.candidate_id}>
+                            <div className="match-card-head">
+                              <div className={`match-ring ${matchClass}`} style={{ "--match": score }}>
+                                <span>{formatPercent(score)}</span>
+                              </div>
+                              <div>
+                                <h3>{formatValue(match.candidate_name)}</h3>
+                                <p>{formatValue(match.current_position)}</p>
+                              </div>
                             </div>
-                          </div>
-                        )}
+                            <div className="match-card-meta">
+                              <span>{formatYears(match.years_experience)} years of experience</span>
+                            </div>
+                            <div className="match-skill-group">
+                              <span>Skills Matched</span>
+                              <div className="skill-tag-list">
+                                {(match.matched_skills || []).length ? (
+                                  match.matched_skills.map((skill) => (
+                                    <span className="skill-tag" key={skill}>{skill}</span>
+                                  ))
+                                ) : (
+                                  <span className="skill-tag is-muted">None</span>
+                                )}
+                              </div>
+                            </div>
+                            <div className="match-skill-group">
+                              <span>Missing Skills</span>
+                              <div className="skill-tag-list">
+                                {(match.missing_skills || []).length ? (
+                                  match.missing_skills.map((skill) => (
+                                    <span className="skill-tag is-missing" key={skill}>{skill}</span>
+                                  ))
+                                ) : (
+                                  <span className="skill-tag">None</span>
+                                )}
+                              </div>
+                            </div>
+                          </article>
+                        );
+                      })}
+                    </div>
 
-                        <button
-                          className="secondary-button"
-                          type="button"
-                          onClick={() => handleViewCandidate({ id: match.candidate_id })}
-                        >
-                          View Profile
-                        </button>
-                      </article>
-                    ))
-                  )}
-                </div>
+                    {otherJobMatches.length > 0 && (
+                      <details className="detail-card">
+                        <summary>Other Candidates</summary>
+                        <div className="match-card-list">
+                          {otherJobMatches.map((match) => {
+                            const score = Number(match.match_percentage) || 0;
+                            const matchClass = score >= 90 ? "is-strong" : score >= 75 ? "is-warning" : "is-danger";
+
+                            return (
+                              <article className="match-card" key={match.candidate_id}>
+                                <div className="match-card-head">
+                                  <div className={`match-ring ${matchClass}`} style={{ "--match": score }}>
+                                    <span>{formatPercent(score)}</span>
+                                  </div>
+                                  <div>
+                                    <h3>{formatValue(match.candidate_name)}</h3>
+                                    <p>{formatValue(match.current_position)}</p>
+                                  </div>
+                                </div>
+                                <div className="match-card-meta">
+                                  <span>{formatYears(match.years_experience)} years of experience</span>
+                                </div>
+                                <div className="match-skill-group">
+                                  <span>Skills Matched</span>
+                                  <div className="skill-tag-list">
+                                    {(match.matched_skills || []).length ? (
+                                      match.matched_skills.map((skill) => (
+                                        <span className="skill-tag" key={skill}>{skill}</span>
+                                      ))
+                                    ) : (
+                                      <span className="skill-tag is-muted">None</span>
+                                    )}
+                                  </div>
+                                </div>
+                                <div className="match-skill-group">
+                                  <span>Missing Skills</span>
+                                  <div className="skill-tag-list">
+                                    {(match.missing_skills || []).length ? (
+                                      match.missing_skills.map((skill) => (
+                                        <span className="skill-tag is-missing" key={skill}>{skill}</span>
+                                      ))
+                                    ) : (
+                                      <span className="skill-tag">None</span>
+                                    )}
+                                  </div>
+                                </div>
+                              </article>
+                            );
+                          })}
+                        </div>
+                      </details>
+                    )}
+                  </>
+                )}
               </>
             ) : (
               <p className="empty-state">Select a job to view candidate matches.</p>
@@ -2847,6 +3064,59 @@ function App() {
           </aside>
         </div>
       </section>
+    );
+  };
+
+  const renderJobMatchCard = (match) => {
+    const score = Number(match.match_percentage) || 0;
+    const matchClass = score >= 90 ? "is-strong" : score >= 75 ? "is-warning" : "is-danger";
+
+    return (
+      <article className="match-card" key={match.candidate_id}>
+        <div className="match-card-head">
+          <div className={`match-ring ${matchClass}`} style={{ "--match": score }}>
+            <span>{formatPercent(score)}</span>
+          </div>
+          <div>
+            <h3>{formatValue(match.candidate_name)}</h3>
+            <p>{formatValue(match.current_position)}</p>
+          </div>
+        </div>
+
+        <div className="match-card-meta">
+          <span>{formatYears(match.years_experience)} years of experience</span>
+        </div>
+
+        <div className="match-skill-group">
+          <span>Skills Matched</span>
+          <div className="skill-tag-list">
+            {(match.matched_skills || []).length ? (
+              match.matched_skills.map((skill) => (
+                <span className="skill-tag" key={skill}>{skill}</span>
+              ))
+            ) : (
+              <span className="skill-tag is-muted">None</span>
+            )}
+          </div>
+        </div>
+
+        <div className="match-skill-group">
+          <span>Missing Skills</span>
+          <div className="skill-tag-list">
+            {(match.missing_skills || []).length ? (
+              match.missing_skills.map((skill) => (
+                <span className="skill-tag is-missing" key={skill}>{skill}</span>
+              ))
+            ) : (
+              <span className="skill-tag">None</span>
+            )}
+          </div>
+        </div>
+
+        <button className="secondary-button" type="button" onClick={() => handleViewCandidate({ id: match.candidate_id })}>
+          View Candidate
+        </button>
+      </article>
     );
   };
 
@@ -3075,6 +3345,107 @@ function App() {
                   <DetailItem label="Created/upload date" value={selectedCandidate.created_at} />
                   <DetailItem label="Summary" value={selectedCandidate.resume_summary} />
                 </dl>
+              </section>
+            </div>
+          </section>
+        </div>
+      )}
+
+      {isJobDetailsModalOpen && selectedJob && (
+        <div className="modal-overlay" onClick={closeJobDetailsModal}>
+          <section
+            className="details-modal job-details-modal"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="job-details-title"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <header className="modal-header">
+              <div>
+                <h2 id="job-details-title">Job Details</h2>
+                <p>{formatValue(selectedJob.title)}</p>
+              </div>
+
+              <button className="modal-close" type="button" onClick={closeJobDetailsModal}>
+                Close
+              </button>
+            </header>
+
+            <div className="job-details-grid">
+              <section className="detail-card">
+                <h3>Job Summary</h3>
+                <dl>
+                  <DetailItem label="Title" value={selectedJob.title} />
+                  <DetailItem label="Location" value={selectedJob.location} />
+                  <DetailItem label="Employment Type" value={selectedJob.employment_type || selectedJob.job_type} />
+                  <DetailItem label="Job Number" value={selectedJob.job_number || selectedJob.job_id} />
+                  <DetailItem label="Salary" value={formatSalary(selectedJob.salary)} />
+                  <DetailItem label="Active Status" value={selectedJob.active ? "Active" : "Inactive"} />
+                  <DetailItem label="Last Scraped" value={formatDate(selectedJob.last_scraped)} />
+                </dl>
+
+                {selectedJob.url && (
+                  <a className="primary-button" href={selectedJob.url} target="_blank" rel="noreferrer">
+                    Open Original Job
+                  </a>
+                )}
+              </section>
+
+              <section className="detail-card">
+                <h3>Job Description</h3>
+                <div className="job-section-stack">
+                  <JobDetailSection title="Job Overview" content={selectedJobDescriptionSections.overview} />
+                  <JobDetailSection
+                    title="Responsibilities"
+                    content={selectedJobDescriptionSections.responsibilities}
+                  />
+                  <JobDetailSection
+                    title="Qualifications"
+                    content={selectedJobDescriptionSections.qualifications}
+                  />
+                  <JobDetailSection
+                    title="Application Notice"
+                    content={selectedJobDescriptionSections.applicationNotice}
+                  />
+                </div>
+              </section>
+            </div>
+
+            <div className="job-details-grid job-details-grid--matches">
+              <section className="detail-card">
+                <h3>Candidate Matches</h3>
+
+                {isLoadingJobMatches ? (
+                  <p className="empty-state">Loading candidate matches...</p>
+                ) : jobMatches.length === 0 ? (
+                  <p className="empty-state">No resumes have been uploaded.</p>
+                ) : strongJobMatches.length === 0 ? (
+                  <>
+                    <p className="empty-state">No strong matches found.</p>
+                    {otherJobMatches.length > 0 && (
+                      <details>
+                        <summary>Other Candidates</summary>
+                        <div className="match-card-list">
+                          {otherJobMatches.map(renderJobMatchCard)}
+                        </div>
+                      </details>
+                    )}
+                  </>
+                ) : (
+                  <>
+                    <div className="match-card-list">
+                      {strongJobMatches.map(renderJobMatchCard)}
+                    </div>
+                    {otherJobMatches.length > 0 && (
+                      <details>
+                        <summary>Other Candidates</summary>
+                        <div className="match-card-list">
+                          {otherJobMatches.map(renderJobMatchCard)}
+                        </div>
+                      </details>
+                    )}
+                  </>
+                )}
               </section>
             </div>
           </section>
@@ -3431,6 +3802,21 @@ function DetailItem({ label, value }) {
       <dt>{label}</dt>
       <dd>{formatValue(value)}</dd>
     </div>
+  );
+}
+
+function JobDetailSection({ title, content }) {
+  const paragraphs = content.length > 0 ? content.flatMap((entry) => toTextParagraphs(entry)) : [];
+
+  return (
+    <article className="job-section-card">
+      <h3>{title}</h3>
+      {paragraphs.length > 0 ? (
+        paragraphs.map((paragraph, index) => <p key={`${title}-${index}`}>{paragraph}</p>)
+      ) : (
+        <p className="job-section-empty">N/A</p>
+      )}
+    </article>
   );
 }
 
