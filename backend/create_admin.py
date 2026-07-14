@@ -1,10 +1,13 @@
 import getpass
+import logging
 import sqlite3
 
 from auth_utils import hash_password
 from database import create_user, get_user_by_email, init_db, update_user_role
+from logging_config import get_logger
 
 VALID_ROLES = {"admin", "recruiter"}
+admin_logger = get_logger("admin")
 
 
 def normalize_email(email: str) -> str:
@@ -30,37 +33,37 @@ def main() -> int:
         email = normalize_email(input("User email: "))
         role = prompt_role()
     except ValueError as exc:
-        print(exc)
+        admin_logger.warning(str(exc))
         return 1
 
     existing_user = get_user_by_email(email)
     if existing_user:
         if existing_user.get("role") == role:
-            print(f"{role.title()} user already exists: {email}")
+            admin_logger.warning("%s user already exists: %s", role.title(), email)
             return 1
         else:
             update_user_role(email, role)
-            print(f"Existing user updated to {role}: {email}")
+            admin_logger.info("Existing user updated to %s: %s", role, email)
             return 0
 
     password = getpass.getpass("Password: ")
     confirm_password = getpass.getpass("Confirm password: ")
 
     if password != confirm_password:
-        print("Passwords do not match.")
+        admin_logger.warning("Passwords do not match.")
         return 1
 
     if len(password) < 8:
-        print("Password must be at least 8 characters.")
+        admin_logger.warning("Password must be at least 8 characters.")
         return 1
 
     try:
         create_user(email, hash_password(password), role=role)
     except sqlite3.IntegrityError:
-        print(f"User already exists: {email}")
+        admin_logger.warning("User already exists: %s", email)
         return 1
 
-    print(f"{role.title()} user created: {email}")
+    admin_logger.info("%s user created: %s", role.title(), email)
     return 0
 
 

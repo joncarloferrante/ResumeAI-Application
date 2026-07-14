@@ -1,15 +1,17 @@
 import json
+import logging
 import re
 import sqlite3
+import time
 from pathlib import Path
 from urllib.parse import urljoin, urlparse
 
-import requests
 from bs4 import BeautifulSoup
+from playwright.sync_api import sync_playwright
+from logging_config import get_logger
 
 START_URL = "https://atlanticrecruiters.com/job-postings/"
 BASE_URL = "https://atlanticrecruiters.com"
-TEST_LIMIT = 5
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DB_PATH = PROJECT_ROOT / "database" / "resumeai.db"
 IGNORED_LINK_TEXTS = {
@@ -25,11 +27,18 @@ IGNORED_LINK_TEXTS = {
     "all locations",
 }
 
+scraper_logger = get_logger("scraper")
+
 
 def get_soup(url: str) -> BeautifulSoup:
-    response = requests.get(url, timeout=15)
-    response.raise_for_status()
-    return BeautifulSoup(response.text, "html.parser")
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.launch(headless=True)
+        page = browser.new_page()
+        page.goto(url, wait_until="networkidle", timeout=60000)
+        html = page.content()
+        browser.close()
+
+    return BeautifulSoup(html, "html.parser")
 
 
 def normalize_url(url: str) -> str:
@@ -173,11 +182,6 @@ def extract_job_details(job_url: str) -> dict[str, str]:
     cleaned_job_text = cleaned_text(content_root.get_text(" ", strip=True)) if content_root else ""
     description = cleaned_job_text
 
-    # Debug the exact text the regex sees before we parse it.
-    print("DEBUG CLEANED JOB TEXT (first 1000 chars):")
-    print(cleaned_job_text[:1000])
-    print("END DEBUG")
-
     # Parse the same cleaned text that is printed above.
     location = extract_field(r"Location:\s*(.*?)(?=\s+Type:)", cleaned_job_text)
     employment_type = extract_field(r"Type:\s*(.*?)(?=\s+Job\s+#)", cleaned_job_text)
@@ -236,6 +240,7 @@ def save_scraped_job(job: dict[str, str]) -> str:
                 job["description"],
                 job["url"],
             ))
+            scraper_logger.info("Existing jobs updated | url=%s", job["url"])
             return "updated"
 
         cursor.execute("""
@@ -261,24 +266,56 @@ def save_scraped_job(job: dict[str, str]) -> str:
             job["job_number"],
             job["salary"],
             job["description"],
-        ))
+            ))
+        scraper_logger.info("New jobs added | url=%s", job["url"])
         return "inserted"
 
 
+def mark_missing_jobs_inactive(active_urls: set[str]) -> int:
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.cursor()
+        if not active_urls:
+            cursor.execute(
+                """
+                UPDATE scraped_jobs
+                SET active = 0,
+                    last_scraped = CURRENT_TIMESTAMP
+                WHERE active = 1
+                """
+            )
+        else:
+            cursor.execute(
+                f"""
+                UPDATE scraped_jobs
+                SET active = 0,
+                    last_scraped = CURRENT_TIMESTAMP
+                WHERE url NOT IN ({",".join("?" for _ in active_urls)})
+                  AND active = 1
+                """,
+                tuple(active_urls),
+            )
+        if cursor.rowcount > 0:
+            scraper_logger.info("Jobs marked inactive | count=%s", cursor.rowcount)
+        return cursor.rowcount
+
+
 def main() -> None:
+    start = time.perf_counter()
     ensure_scraped_jobs_table()
+    scraper_logger.info("Scraper started")
 
     listing_soup = get_soup(START_URL)
-    job_urls = find_listing_links(listing_soup)[:TEST_LIMIT]
+    job_urls = find_listing_links(listing_soup)
 
     jobs_found = len(job_urls)
+    scraper_logger.info("Website currently being scraped | url=%s | jobs_discovered=%s", START_URL, jobs_found)
     jobs_inserted = 0
     jobs_updated = 0
     jobs_skipped_errors = 0
 
     total_jobs = len(job_urls)
     for index, job_url in enumerate(job_urls, start=1):
-        print(f"Scraping job {index} of {total_jobs}")
+        scraper_logger.info("Processing job %s of %s", index, total_jobs)
         try:
             details = extract_job_details(job_url)
             save_result = save_scraped_job(details)
@@ -287,24 +324,20 @@ def main() -> None:
             elif save_result == "updated":
                 jobs_updated += 1
 
-            print("Job Title:", details["title"])
-            print("Job URL:", details["url"])
-            print("Location:", details["location"] or "Not found")
-            print("Department:", details["department"] or "Not found")
-            print("Employment Type:", details["employment_type"] or "Not found")
-            print("Job Number:", details["job_number"] or "Not found")
-            print("Salary:", details["salary"] or "Not found")
-            print("Description Preview:", details["description"][:500])
-            print("-" * 60)
+            scraper_logger.debug("Job scraped | title=%s | url=%s | location=%s | department=%s", details["title"], details["url"], details["location"] or "Not found", details["department"] or "Not found")
         except Exception as exc:
             jobs_skipped_errors += 1
-            print(f"Error scraping {job_url}: {exc}")
+            scraper_logger.exception("Error scraping job | url=%s", job_url)
 
-    print("Summary:")
-    print(f"jobs found: {jobs_found}")
-    print(f"jobs inserted: {jobs_inserted}")
-    print(f"jobs updated: {jobs_updated}")
-    print(f"jobs skipped/errors: {jobs_skipped_errors}")
+    jobs_marked_inactive = mark_missing_jobs_inactive(set(job_urls))
+
+    scraper_logger.info("Scrape completed")
+    scraper_logger.info("Total runtime %.2f seconds", time.perf_counter() - start)
+    scraper_logger.info("jobs found: %s", jobs_found)
+    scraper_logger.info("jobs inserted: %s", jobs_inserted)
+    scraper_logger.info("jobs updated: %s", jobs_updated)
+    scraper_logger.info("jobs skipped/errors: %s", jobs_skipped_errors)
+    scraper_logger.info("jobs marked inactive: %s", jobs_marked_inactive)
 
 
 if __name__ == "__main__":

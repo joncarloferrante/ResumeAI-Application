@@ -36,6 +36,7 @@ import argparse
 import calendar
 import csv
 import json
+import logging
 import re
 import subprocess
 import tempfile
@@ -66,6 +67,9 @@ except ImportError:
 
 DEFAULT_MODEL = "qwen2.5-coder-3b-instruct"
 DEFAULT_BASE_URL = "http://localhost:1234/v1"
+from logging_config import get_logger
+
+parser_logger = get_logger("parser")
 
 # The CSV columns are intentionally explicit and ordered. Keeping this list in one
 # place prevents the row dictionaries and CSV writer from getting out of sync.
@@ -2639,7 +2643,7 @@ def main() -> None:
         try:
             client = create_lmstudio_client(args.lmstudio_url)
         except Exception as exc:
-            print(f"LM Studio client could not be created. Continuing without Qwen. Error: {exc}")
+            parser_logger.warning("LM Studio client could not be created. Continuing without Qwen. Error: %s", exc)
             use_llm = False
 
     rows = []
@@ -2656,18 +2660,18 @@ def main() -> None:
                 args.allow_regex_fallback,
             )
             rows.append(row)
-            print(f"Parsed: {resume_file.name}")
+            parser_logger.info("Parsed: %s", resume_file.name)
         except Exception as exc:
             errors.append((resume_file.name, str(exc)))
-            print(f"ERROR parsing {resume_file.name}: {exc}")
+            parser_logger.exception("ERROR parsing %s", resume_file.name)
 
     write_csv(rows, output_csv)
-    print(f"\nDone. Wrote {len(rows)} rows to {output_csv}")
+    parser_logger.info("Done. Wrote %s rows to %s", len(rows), output_csv)
 
     if errors:
-        print("\nFiles with errors:")
+        parser_logger.warning("Files with errors:")
         for filename, error in errors:
-            print(f"- {filename}: {error}")
+            parser_logger.warning("- %s: %s", filename, error)
 
 
 if __name__ == "__main__":

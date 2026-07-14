@@ -1,12 +1,31 @@
 import json
+import logging
 import re
 import sqlite3
+import time
 from collections import Counter
 from pathlib import Path
+import hashlib
+
+try:
+    from openai import OpenAI
+except ImportError:
+    OpenAI = None
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DB_PATH = PROJECT_ROOT / "database" / "resumeai.db"
 VALID_ROLES = {"admin", "recruiter"}
+TOP_PYTHON_MATCHES = 8
+TOP_QWEN_MATCHES = 3
+DEFAULT_QWEN_MODEL = "qwen2.5-coder-3b-instruct"
+DEFAULT_QWEN_BASE_URL = "http://localhost:1234/v1"
+MATCH_CACHE_VERSION = "2026-07-14a"
+_MATCH_DEBUG_PRINTED = False
+
+from logging_config import get_logger
+
+db_logger = get_logger("database")
+matcher_logger = get_logger("matcher")
 
 
 def _normalize_username_base(value: str) -> str:
@@ -36,10 +55,13 @@ def _unique_username_from_email(email: str, used_usernames: set[str]) -> str:
 
 def get_connection():
     DB_PATH.parent.mkdir(exist_ok=True)
-    return sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH)
+    db_logger.info("SQLite connected")
+    return conn
 
 
 def init_db():
+    start = time.perf_counter()
     conn = get_connection()
     cursor = conn.cursor()
 
@@ -105,6 +127,7 @@ def init_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             filename TEXT,
             candidate TEXT,
+            current_title TEXT,
             email TEXT,
             phone TEXT,
             employment_status TEXT,
@@ -117,6 +140,10 @@ def init_db():
             current_company TEXT,
             resume_summary TEXT,
             needs_review TEXT,
+            industries TEXT,
+            certifications TEXT,
+            education TEXT,
+            keywords TEXT,
             file_hash TEXT,
             raw_json TEXT,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
@@ -125,8 +152,16 @@ def init_db():
 
     cursor.execute("PRAGMA table_info(candidates)")
     candidate_columns = {row[1] for row in cursor.fetchall()}
-    if "file_hash" not in candidate_columns:
-        cursor.execute("ALTER TABLE candidates ADD COLUMN file_hash TEXT")
+    for column_name, column_definition in {
+        "current_title": "TEXT",
+        "industries": "TEXT",
+        "certifications": "TEXT",
+        "education": "TEXT",
+        "keywords": "TEXT",
+        "file_hash": "TEXT",
+    }.items():
+        if column_name not in candidate_columns:
+            cursor.execute(f"ALTER TABLE candidates ADD COLUMN {column_name} {column_definition}")
 
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS audit_logs (
@@ -159,11 +194,30 @@ def init_db():
             status TEXT NOT NULL DEFAULT 'open',
             description TEXT,
             required_skills TEXT,
+            preferred_skills TEXT,
+            years_required TEXT,
+            industry TEXT,
+            certifications TEXT,
+            keywords TEXT,
             salary TEXT,
             created_by TEXT,
             updated_by TEXT,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS match_cache (
+            job_id INTEGER NOT NULL,
+            candidate_id INTEGER NOT NULL,
+            job_fingerprint TEXT NOT NULL,
+            candidate_fingerprint TEXT NOT NULL,
+            is_stale INTEGER NOT NULL DEFAULT 0,
+            match_json TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (job_id, candidate_id)
         )
     """)
 
@@ -177,17 +231,28 @@ def init_db():
         "status": "TEXT NOT NULL DEFAULT 'open'",
         "description": "TEXT",
         "required_skills": "TEXT",
-        "salary": "TEXT",
-        "created_by": "TEXT",
-        "updated_by": "TEXT",
+        "preferred_skills": "TEXT",
+        "years_required": "TEXT",
+        "industry": "TEXT",
+            "certifications": "TEXT",
+            "keywords": "TEXT",
+            "salary": "TEXT",
+            "created_by": "TEXT",
+            "updated_by": "TEXT",
         "created_at": "TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
         "updated_at": "TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
     }.items():
         if column_name not in job_columns:
             cursor.execute(f"ALTER TABLE jobs ADD COLUMN {column_name} {column_definition}")
 
+    cursor.execute("PRAGMA table_info(match_cache)")
+    match_cache_columns = {row[1] for row in cursor.fetchall()}
+    if "is_stale" not in match_cache_columns:
+        cursor.execute("ALTER TABLE match_cache ADD COLUMN is_stale INTEGER NOT NULL DEFAULT 0")
+
     conn.commit()
     conn.close()
+    db_logger.info("Database initialization complete in %.2f seconds", time.perf_counter() - start)
 
 
 def validate_role(role: str) -> str:
@@ -229,6 +294,7 @@ def create_user(
     user_id = cursor.lastrowid
     conn.commit()
     conn.close()
+    db_logger.info("User created | user_id=%s | email=%s | role=%s", user_id, email, normalized_role)
 
     return user_id
 
@@ -246,6 +312,7 @@ def update_user_role(email: str, role: str) -> None:
 
     conn.commit()
     conn.close()
+    db_logger.info("Role changed | email=%s | role=%s", email, normalized_role)
 
 
 def get_user_by_username(username: str):
@@ -340,7 +407,25 @@ def find_duplicate_candidate(filename: str, email: str, file_hash: str | None = 
 def save_candidate(filename: str, parsed_data: dict, file_hash: str | None = None) -> int | None:
     email = str(parsed_data.get("Email", "")).strip()
     if find_duplicate_candidate(filename, email, file_hash):
+        db_logger.warning("Duplicate candidate skipped | filename=%s | email=%s", filename, email)
         return None
+
+    candidate_name = str(parsed_data.get("Candidate", "")).strip()
+    current_title = str(parsed_data.get("Current Position", "")).strip()
+    skills_text = str(parsed_data.get("Normalized Skills", "") or parsed_data.get("Skills", "")).strip()
+    industries = _split_certifications(parsed_data.get("Industries", ""))
+    certifications = _split_certifications(parsed_data.get("Certifications", ""))
+    education = _safe_text_blob(parsed_data.get("Education", ""))
+    keywords = _simple_keywords(
+        " ".join([
+            candidate_name,
+            current_title,
+            skills_text,
+            str(parsed_data.get("Resume Summary", "")),
+            education,
+        ]),
+        18,
+    )
 
     conn = get_connection()
     cursor = conn.cursor()
@@ -349,6 +434,7 @@ def save_candidate(filename: str, parsed_data: dict, file_hash: str | None = Non
         INSERT INTO candidates (
             filename,
             candidate,
+            current_title,
             email,
             phone,
             employment_status,
@@ -361,13 +447,18 @@ def save_candidate(filename: str, parsed_data: dict, file_hash: str | None = Non
             current_company,
             resume_summary,
             needs_review,
+            industries,
+            certifications,
+            education,
+            keywords,
             file_hash,
             raw_json
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
         filename,
-        parsed_data.get("Candidate", ""),
+        candidate_name,
+        current_title,
         email,
         parsed_data.get("Phone Number", ""),
         parsed_data.get("Employment Status", ""),
@@ -380,6 +471,10 @@ def save_candidate(filename: str, parsed_data: dict, file_hash: str | None = Non
         parsed_data.get("Current Company", ""),
         parsed_data.get("Resume Summary", ""),
         parsed_data.get("Needs Review", ""),
+        ", ".join(industries),
+        ", ".join(certifications),
+        education,
+        ", ".join(keywords),
         file_hash,
         json.dumps(parsed_data)
     ))
@@ -387,6 +482,8 @@ def save_candidate(filename: str, parsed_data: dict, file_hash: str | None = Non
     candidate_id = cursor.lastrowid
     conn.commit()
     conn.close()
+    touch_candidate_match_staleness(candidate_id)
+    db_logger.info("Candidate saved (ID=%s)", candidate_id)
 
     return candidate_id
 
@@ -413,6 +510,11 @@ def get_candidates():
             current_company,
             resume_summary,
             needs_review,
+            current_title,
+            industries,
+            certifications,
+            education,
+            keywords,
             created_at
         FROM candidates
         ORDER BY id DESC
@@ -452,6 +554,774 @@ def split_job_skills(skills: str | None) -> list[str]:
             parsed_skills.append(clean_skill)
 
     return parsed_skills
+
+
+def _safe_text_blob(value) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, (list, tuple, set)):
+        return " ".join(_safe_text_blob(item) for item in value)
+    if isinstance(value, dict):
+        return " ".join(_safe_text_blob(item) for item in value.values())
+    return re.sub(r"\s+", " ", str(value)).strip()
+
+
+def _simple_keywords(text: str | None, limit: int = 12) -> list[str]:
+    tokens = []
+    for token in re.findall(r"[A-Za-z0-9#+.&-]{3,}", str(text or "").lower()):
+        if token not in tokens:
+            tokens.append(token)
+    return tokens[:limit]
+
+
+COMMON_SKILL_PHRASES = [
+    "excel",
+    "microsoft excel",
+    "word",
+    "powerpoint",
+    "financial modeling",
+    "financial analysis",
+    "accounting",
+    "bookkeeping",
+    "audit",
+    "auditing",
+    "sql",
+    "python",
+    "data analysis",
+    "data analytics",
+    "power bi",
+    "tableau",
+    "vba",
+    "access",
+    "reconciliation",
+    "forecasting",
+    "budgeting",
+    "valuation",
+    "reporting",
+    "compliance",
+    "recruiting",
+    "talent acquisition",
+    "salesforce",
+    "crm",
+    "project management",
+    "risk management",
+    "operations",
+    "client service",
+    "communication",
+]
+
+
+def _extract_skill_phrases(text: str | None, limit: int = 12) -> list[str]:
+    normalized = str(text or "").lower()
+    found = []
+    for phrase in COMMON_SKILL_PHRASES:
+        if phrase in normalized and phrase not in found:
+            found.append(phrase)
+    for token in re.findall(r"[A-Za-z0-9#+.&-]{3,}", normalized):
+        if token not in found:
+            found.append(token)
+    return found[:limit]
+
+
+def _has_meaningful_text(value: str | None) -> bool:
+    text = str(value or "").strip()
+    return bool(text) and text.lower() not in {"not found", "n/a", "none"}
+
+
+def _extract_years_required(value) -> float | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    match = re.search(r"\d+(?:\.\d+)?", text)
+    return float(match.group(0)) if match else None
+
+
+def _extract_experience_keywords(text: str | None, limit: int = 10) -> list[str]:
+    source = str(text or "").lower()
+    keywords = []
+    for phrase in COMMON_SKILL_PHRASES:
+        if phrase in source and phrase not in keywords:
+            keywords.append(phrase)
+    for token in re.findall(r"\b[a-z][a-z&+/.-]{2,}\b", source):
+        if token not in keywords and token not in {"and", "the", "with", "for", "from", "this", "that", "will", "you"}:
+            keywords.append(token)
+    return keywords[:limit]
+
+
+def _split_certifications(value) -> list[str]:
+    text = _safe_text_blob(value)
+    if not text:
+        return []
+    return [item.strip() for item in re.split(r"[,;\n|]+", text) if item.strip()][:12]
+
+
+def _create_qwen_client():
+    if OpenAI is None:
+        return None
+    try:
+        return OpenAI(base_url=DEFAULT_QWEN_BASE_URL, api_key="lm-studio")
+    except Exception:
+        return None
+
+
+def _stable_json(value: dict) -> str:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+
+
+def _fingerprint(value: dict) -> str:
+    payload = {
+        "version": MATCH_CACHE_VERSION,
+        "value": value,
+    }
+    return hashlib.sha256(_stable_json(payload).encode("utf-8")).hexdigest()
+
+
+def _extract_json_object(text: str) -> dict:
+    content = str(text or "").strip().replace("```json", "").replace("```", "").strip()
+    start = content.find("{")
+    end = content.rfind("}")
+    if start == -1 or end == -1 or end <= start:
+        raise json.JSONDecodeError("No JSON object found", content, 0)
+
+    json_text = content[start : end + 1]
+    try:
+        parsed = json.loads(json_text)
+    except json.JSONDecodeError:
+        cleaned = re.sub(r",\s*([}\]])", r"\1", json_text)
+        parsed = json.loads(cleaned)
+
+    if not isinstance(parsed, dict):
+        raise ValueError("LLM response was not a JSON object.")
+
+    return parsed
+
+
+def _compact_text(value: str | None, limit: int) -> str:
+    """Keep prompts small by trimming noisy whitespace and capping text length."""
+    text = re.sub(r"\s+", " ", str(value or "")).strip()
+    return text[:limit]
+
+
+def _candidate_match_context(candidate: dict) -> dict:
+    """Build a privacy-aware snapshot of candidate data for matching."""
+    parsed_resume = {}
+    raw_json = candidate.get("raw_json")
+    if isinstance(raw_json, str) and raw_json.strip():
+        try:
+            parsed_resume = json.loads(raw_json)
+        except json.JSONDecodeError:
+            parsed_resume = {}
+    elif isinstance(raw_json, dict):
+        parsed_resume = raw_json
+
+    return {
+        "candidate_name": _compact_text(candidate.get("candidate"), 120),
+        "current_position": _compact_text(candidate.get("current_position"), 160),
+        "current_company": _compact_text(candidate.get("current_company"), 160),
+        "years_experience": candidate.get("total_experience_years"),
+        "career_span_years": candidate.get("career_span_years"),
+        "skills": split_normalized_skills(candidate.get("normalized_skills")) or split_normalized_skills(candidate.get("skills")),
+        "summary": _compact_text(candidate.get("resume_summary"), 1200),
+        "employment_status": _compact_text(candidate.get("employment_status"), 80),
+        "needs_review": _compact_text(candidate.get("needs_review"), 40),
+        "industries": _split_certifications(candidate.get("industries")),
+        "certifications": _split_certifications(candidate.get("certifications")),
+        "education": _compact_text(candidate.get("education"), 1200),
+        "keywords": _simple_keywords(candidate.get("keywords"), 18),
+        "skill_phrases": _extract_skill_phrases(
+            " ".join([
+                _compact_text(candidate.get("skills"), 1200),
+                _compact_text(candidate.get("normalized_skills"), 1200),
+                _compact_text(candidate.get("resume_summary"), 1200),
+                _compact_text(candidate.get("education"), 1200),
+                _compact_text(candidate.get("current_position"), 160),
+                _safe_text_blob(candidate.get("raw_json")),
+            ]),
+            20,
+        ),
+        "resume_text": _compact_text(
+            parsed_resume.get("Resume Summary")
+            or parsed_resume.get("Resume Text")
+            or parsed_resume.get("Parsed Text")
+            or parsed_resume.get("full_text"),
+            3500,
+        ),
+        "extract_status": {
+            "current_position": "extracted" if _has_meaningful_text(candidate.get("current_position")) else "not extracted",
+            "skills": "extracted" if split_normalized_skills(candidate.get("normalized_skills")) or split_normalized_skills(candidate.get("skills")) else "not extracted",
+            "years_experience": "extracted" if candidate.get("total_experience_years") not in {None, ""} else "not extracted",
+            "certifications": "extracted" if _has_meaningful_text(candidate.get("certifications")) else "not extracted",
+            "education": "extracted" if _has_meaningful_text(candidate.get("education")) else "not extracted",
+            "industry": "extracted" if _has_meaningful_text(candidate.get("industries")) else "not extracted",
+            "keywords": "extracted" if _has_meaningful_text(candidate.get("keywords")) else "not extracted",
+            "summary": "extracted" if _has_meaningful_text(candidate.get("resume_summary")) else "not extracted",
+            "resume_text": "extracted" if _has_meaningful_text(parsed_resume.get("Resume Summary") or parsed_resume.get("Resume Text") or parsed_resume.get("Parsed Text") or parsed_resume.get("full_text")) else "not extracted",
+        },
+    }
+
+
+def _job_match_context(job: dict) -> dict:
+    """Build a compact job snapshot for the recruiter prompt."""
+    description_text = _compact_text(job.get("description"), 6000)
+    title_text = _compact_text(job.get("title"), 160)
+    explicit_required = split_job_skills(job.get("required_skills"))
+    explicit_preferred = split_job_skills(job.get("preferred_skills"))
+    extracted_required = _extract_skill_phrases(
+        " ".join([
+            description_text,
+            _compact_text(job.get("department"), 120),
+            _compact_text(job.get("industry"), 80),
+            _compact_text(job.get("certifications"), 200),
+            _compact_text(job.get("keywords"), 200),
+        ]),
+        18,
+    )
+    extracted_preferred = _extract_skill_phrases(
+        " ".join([
+            description_text,
+            _compact_text(job.get("qualifications"), 1200),
+            _compact_text(job.get("requirements"), 1200),
+            _compact_text(job.get("preferred_qualifications"), 1200),
+            _compact_text(job.get("preferred_qualifications"), 1200),
+        ]),
+        12,
+    )
+    required_skills = list(dict.fromkeys(explicit_required + extracted_required))
+    preferred_skills = list(dict.fromkeys(explicit_preferred + extracted_preferred))
+    years_required = _extract_years_required(job.get("years_required"))
+    return {
+        "title": title_text,
+        "department": _compact_text(job.get("department"), 120),
+        "location": _compact_text(job.get("location"), 120),
+        "job_type": _compact_text(job.get("job_type"), 80),
+        "status": _compact_text(job.get("status"), 40),
+        "description": description_text,
+        "required_skills": required_skills,
+        "preferred_skills": preferred_skills,
+        "years_required": years_required,
+        "industry": _compact_text(job.get("industry"), 80),
+        "certifications": _split_certifications(job.get("certifications")),
+        "keywords": _simple_keywords(job.get("keywords"), 18),
+        "description_skills": _extract_skill_phrases(description_text, 12),
+        "extract_status": {
+            "required_skills": "extracted" if required_skills else "not extracted",
+            "preferred_skills": "extracted" if preferred_skills else "not extracted",
+            "years_required": "extracted" if years_required is not None else "not specified",
+            "certifications": "extracted" if _split_certifications(job.get("certifications")) else "not specified",
+            "education": "not specified",
+            "industry": "extracted" if _has_meaningful_text(job.get("industry")) else "not specified",
+            "location": "extracted" if _has_meaningful_text(job.get("location")) else "not specified",
+        },
+    }
+
+
+def _normalize_match_level(score: int) -> str:
+    if score >= 85:
+        return "Excellent Match"
+    if score >= 70:
+        return "Strong Match"
+    if score >= 45:
+        return "Possible Match"
+    return "Weak Match"
+
+
+def _normalize_recommended_action(score: int) -> str:
+    if score >= 70:
+        return "Interview"
+    if score >= 45:
+        return "Review"
+    return "Reject"
+
+
+def _get_cached_match(job_id: int, candidate_id: int, job_fingerprint: str, candidate_fingerprint: str) -> dict | None:
+    conn = get_connection()
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT match_json, is_stale, created_at, updated_at
+        FROM match_cache
+        WHERE job_id = ? AND candidate_id = ? AND job_fingerprint = ? AND candidate_fingerprint = ?
+    """, (job_id, candidate_id, job_fingerprint, candidate_fingerprint))
+    row = cursor.fetchone()
+    conn.close()
+    if not row:
+        matcher_logger.debug("Match cache miss | job_id=%s | candidate_id=%s", job_id, candidate_id)
+        return None
+    try:
+        cached = json.loads(row["match_json"])
+        if isinstance(cached, dict):
+            if row["is_stale"]:
+                matcher_logger.info("Stale match | job_id=%s | candidate_id=%s", job_id, candidate_id)
+                cached["is_stale"] = True
+                return cached
+            matcher_logger.info("Match cache hit | job_id=%s | candidate_id=%s", job_id, candidate_id)
+            cached["is_cached"] = True
+            cached["cached"] = True
+            cached["is_stale"] = bool(row["is_stale"])
+            cached["cache_created_at"] = row["created_at"]
+            cached["cache_updated_at"] = row["updated_at"]
+            return cached
+        return None
+    except json.JSONDecodeError:
+        return None
+
+
+def _safe_string_list(value, limit: int = 8) -> list[str]:
+    if isinstance(value, str):
+        items = [item.strip() for item in re.split(r"[,;\n]+", value) if item.strip()]
+    elif isinstance(value, list):
+        items = [str(item).strip() for item in value if str(item).strip()]
+    else:
+        items = []
+    return items[:limit]
+
+
+def _normalize_qwen_score(value, python_score: int) -> tuple[int, object]:
+    if value in {None, ""}:
+        return python_score, value
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return python_score, value
+    if 0 < numeric < 1:
+        numeric *= 100
+    score = int(round(numeric))
+    if score <= 0 and python_score > 0:
+        return python_score, value
+    return max(0, min(100, score)), value
+
+
+def _normalize_match_level(score: int) -> str:
+    if score >= 85:
+        return "Excellent Match"
+    if score >= 70:
+        return "Strong Match"
+    if score >= 45:
+        return "Possible Match"
+    return "Weak Match"
+
+
+def _normalize_recommendation(label: str | None, score: int) -> str:
+    cleaned = str(label or "").strip().lower()
+    if cleaned in {"strong match", "possible match", "weak match"}:
+        return cleaned
+    return (
+        "strong match" if score >= 70 else "possible match" if score >= 45 else "weak match"
+    )
+
+
+def _create_python_match(job: dict, candidate: dict) -> dict:
+    job_struct = _job_match_context(job)
+    candidate_struct = _candidate_match_context(candidate)
+
+    required_skills = job_struct["required_skills"]
+    preferred_skills = job_struct["preferred_skills"]
+    candidate_skills = candidate_struct["skills"]
+    candidate_skill_phrases = candidate_struct["skill_phrases"]
+    candidate_skill_keys = {normalize_skill_key(skill) for skill in candidate_skills}
+    candidate_phrase_keys = {normalize_skill_key(skill) for skill in candidate_skill_phrases}
+
+    matched_skills = [skill for skill in required_skills if normalize_skill_key(skill) in candidate_skill_keys or normalize_skill_key(skill) in candidate_phrase_keys]
+    missing_skills = [skill for skill in required_skills if normalize_skill_key(skill) not in candidate_skill_keys and normalize_skill_key(skill) not in candidate_phrase_keys]
+    preferred_matches = [skill for skill in preferred_skills if normalize_skill_key(skill) in candidate_skill_keys or normalize_skill_key(skill) in candidate_phrase_keys]
+    missing_preferred = [skill for skill in preferred_skills if normalize_skill_key(skill) not in candidate_skill_keys and normalize_skill_key(skill) not in candidate_phrase_keys]
+
+    # The Python layer ranks everyone first using direct signals from the job and
+    # resume data. This keeps the system fast and prevents unnecessary model calls.
+    job_blob = _safe_text_blob(
+        [
+            job_struct["title"],
+            job_struct["department"],
+            job_struct["location"],
+            job_struct["job_type"],
+            job_struct["status"],
+            job_struct["description"],
+            job_struct["industry"],
+            job_struct["certifications"],
+            job_struct["keywords"],
+            required_skills,
+            preferred_skills,
+        ]
+    ).lower()
+    candidate_blob = _safe_text_blob(
+        [
+            candidate_struct["candidate_name"],
+            candidate_struct["current_position"],
+            candidate_struct["current_company"],
+            candidate_struct["summary"],
+            candidate_struct["resume_text"],
+            candidate_struct["skills"],
+            candidate_struct["industries"],
+            candidate_struct["certifications"],
+            candidate_struct["education"],
+            candidate_struct["keywords"],
+        ]
+    ).lower()
+
+    job_terms = set(re.findall(r"[a-z0-9#+.&-]{3,}", job_blob))
+    candidate_terms = set(re.findall(r"[a-z0-9#+.&-]{3,}", candidate_blob))
+
+    title_terms = set(re.findall(r"[a-z0-9#+.&-]{3,}", job_struct["title"].lower()))
+    position_terms = set(re.findall(r"[a-z0-9#+.&-]{3,}", candidate_struct["current_position"].lower()))
+    title_overlap = len(title_terms & position_terms)
+    title_exact = job_struct["title"].lower() == candidate_struct["current_position"].lower()
+    title_close_match = bool(title_terms & position_terms)
+
+    skill_score = 0.0
+    if required_skills:
+        required_ratio = len(matched_skills) / len(required_skills)
+        skill_score += required_ratio * 50
+        if matched_skills:
+            skill_score += min(6, len(matched_skills) * 1.2)
+    if preferred_skills:
+        skill_score += (len(preferred_matches) / max(1, len(preferred_skills))) * 12
+
+    title_score = 0.0
+    if title_exact:
+        title_score = 22
+    elif title_close_match:
+        title_score = min(18, title_overlap * 6)
+    else:
+        title_score = min(10, len(job_terms & candidate_terms) * 0.9)
+    if title_terms and any(term in candidate_struct["current_position"].lower() for term in title_terms):
+        title_score += 2
+
+    relevance_score = min(10, len(job_terms & candidate_terms) * 0.75)
+    description_skill_matches = [skill for skill in job_struct["description_skills"] if normalize_skill_key(skill) in candidate_skill_keys or normalize_skill_key(skill) in candidate_phrase_keys]
+    if description_skill_matches:
+        relevance_score += min(6, len(description_skill_matches) * 1.2)
+
+    years_required = 0.0
+    years_required = float(job_struct["years_required"] or 0)
+
+    try:
+        years_experience = float(candidate.get("total_experience_years") or 0)
+    except (TypeError, ValueError):
+        years_experience = 0.0
+
+    years_score = 0.0
+    if years_required > 0:
+        delta = years_experience - years_required
+        years_score = 12 if delta >= 2 else 10 if delta >= 0 else 6 if delta >= -1 else 2 if delta >= -2 else 0
+    elif years_experience > 0:
+        years_score = min(10, years_experience * 0.9)
+    years_detail = {
+        "required_years": years_required or None,
+        "candidate_years": years_experience or None,
+        "meets_requirement": bool(years_required > 0 and years_experience >= years_required),
+    }
+
+    location_score = 0.0
+    job_location = str(job_struct["location"]).lower()
+    candidate_location_blob = " ".join(
+        filter(None, [
+            candidate_struct["current_company"],
+            candidate_struct["summary"],
+            candidate_struct["resume_text"],
+        ])
+    ).lower()
+    if job_location in {"remote", "hybrid"}:
+        location_score = 4 if "remote" in candidate_location_blob or "hybrid" in candidate_location_blob else 2
+    elif job_location and job_location in candidate_location_blob:
+        location_score = 6
+    location_detail = {
+        "job_location": job_struct["location"] or None,
+        "candidate_location_match": bool(location_score > 0),
+    }
+
+    certification_score = 0.0
+    job_certs = job_struct["certifications"]
+    candidate_certs = candidate_struct["certifications"]
+    candidate_cert_keys = {normalize_skill_key(item) for item in candidate_certs}
+    cert_matches = [cert for cert in job_certs if normalize_skill_key(cert) in candidate_cert_keys]
+    if job_certs:
+        certification_score = (len(cert_matches) / len(job_certs)) * 8
+        if not cert_matches:
+            certification_score = max(0, certification_score - 2)
+    certification_detail = {
+        "required_certifications": job_certs,
+        "matched_certifications": cert_matches,
+        "missing_certifications": [cert for cert in job_certs if cert not in cert_matches],
+    }
+
+    industry_score = 0.0
+    job_industry = job_struct["industry"].lower()
+    candidate_industry_blob = " ".join(candidate_struct["industries"]).lower()
+    if job_industry and job_industry in candidate_industry_blob:
+        industry_score = 8
+    elif job_industry and job_industry in candidate_blob:
+        industry_score = 5
+    industry_detail = {
+        "job_industry": job_struct["industry"] or None,
+        "candidate_industries": candidate_struct["industries"],
+        "industry_match": bool(industry_score > 0),
+    }
+
+    education_score = 0.0
+    education_text = candidate_struct["education"].lower()
+    if education_text:
+        degree_terms = {"bachelor", "bachelors", "master", "masters", "mba", "phd", "ph.d", "ms", "ma", "bs", "ba", "bba", "jd", "md", "cfa", "cpa"}
+        if any(term in education_text for term in degree_terms):
+            education_score = 4
+        if any(term in education_text for term in {"accounting", "finance", "engineering", "computer science", "business", "data", "information systems"}):
+            education_score += 2
+    if job_certs and education_text:
+        education_score = min(6, education_score)
+    education_detail = {
+        "candidate_education": candidate_struct["education"] or None,
+        "education_signal": bool(education_score > 0),
+    }
+
+    keyword_score = min(4, len(job_terms & candidate_terms) * 0.25)
+    summary_bonus = 4 if candidate_struct["summary"] else 0
+    resume_bonus = 4 if candidate_struct["resume_text"] else 0
+    transferable_bonus = min(6, len(set(job_terms) & set(candidate_struct["skill_phrases"])) * 0.5)
+
+    score = skill_score + title_score + relevance_score + years_score + location_score + certification_score + industry_score + education_score + keyword_score + summary_bonus + resume_bonus + transferable_bonus
+    if required_skills and not matched_skills:
+        score *= 0.8
+    if preferred_skills and preferred_matches:
+        score += min(4, len(preferred_matches) * 1.5)
+    if not title_close_match and not matched_skills:
+        score *= 0.88
+    if years_required > 0 and years_experience >= years_required:
+        score += 2
+
+    match_score = max(0, min(100, int(round(score))))
+    matcher_logger.debug(
+        "Python score components | job_title=%s | candidate_id=%s | title_score=%.2f | required_skills_score=%.2f | preferred_skills_score=%.2f | experience_score=%.2f | industry_score=%.2f | education_score=%.2f | certification_score=%.2f | location_score=%.2f | python_total_score=%s",
+        job_struct["title"],
+        candidate.get("id"),
+        title_score,
+        skill_score,
+        (len(preferred_matches) / max(1, len(preferred_skills))) * 12 if preferred_skills else 0.0,
+        years_score,
+        industry_score,
+        education_score,
+        certification_score,
+        location_score,
+        match_score,
+    )
+    return {
+        "match_source": "Python Match",
+        "match_score": match_score,
+        "match_percentage": match_score,
+        "match_level": _normalize_match_level(match_score),
+        "matched_skills": matched_skills[:12],
+        "missing_skills": missing_skills[:12],
+        "required_skills": required_skills,
+        "preferred_skills": preferred_skills,
+        "matched_preferred_skills": preferred_matches[:12],
+        "missing_preferred_skills": missing_preferred[:12],
+        "strengths": matched_skills[:5],
+        "gaps": missing_skills[:5],
+        "job_title_fit": {
+            "job_title": job_struct["title"] or None,
+            "candidate_title": candidate_struct["current_position"] or None,
+            "exact_match": title_exact,
+            "close_match": title_close_match,
+        },
+        "years_of_experience": years_detail,
+        "industry_match": industry_detail,
+        "certification_match": certification_detail,
+        "education_match": education_detail,
+        "location_match": location_detail,
+        "extraction_status": {
+            "job": job_struct["extract_status"],
+            "candidate": candidate_struct["extract_status"],
+        },
+        "recruiter_summary": (
+            "Strong Python match: core skills and title fit are aligned, with supporting experience."
+            if match_score >= 70
+            else "Possible Python match: some core fit exists, but the candidate is missing part of the required profile."
+            if match_score >= 45
+            else "Weak Python match: limited overlap with required skills, role fit, or experience."
+        ),
+        "recommended_action": "Interview" if match_score >= 70 else "Review" if match_score >= 45 else "Reject",
+    }
+
+
+def _store_cached_match(job_id: int, candidate_id: int, job_fingerprint: str, candidate_fingerprint: str, match: dict) -> None:
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        INSERT INTO match_cache (job_id, candidate_id, job_fingerprint, candidate_fingerprint, is_stale, match_json, updated_at)
+        VALUES (?, ?, ?, ?, 0, ?, CURRENT_TIMESTAMP)
+        ON CONFLICT(job_id, candidate_id) DO UPDATE SET
+            job_fingerprint = excluded.job_fingerprint,
+            candidate_fingerprint = excluded.candidate_fingerprint,
+            is_stale = 0,
+            match_json = excluded.match_json,
+            updated_at = CURRENT_TIMESTAMP
+    """, (job_id, candidate_id, job_fingerprint, candidate_fingerprint, json.dumps(match, separators=(",", ":"))))
+    conn.commit()
+    cursor.execute("""
+        SELECT job_id, candidate_id, job_fingerprint, candidate_fingerprint, is_stale, match_json
+        FROM match_cache
+        WHERE job_id = ? AND candidate_id = ?
+    """, (job_id, candidate_id))
+    saved_row = cursor.fetchone()
+    conn.close()
+    if saved_row:
+        saved_match = {}
+        try:
+            saved_match = json.loads(saved_row[5] or "{}")
+        except json.JSONDecodeError:
+            saved_match = {}
+        matcher_logger.info(
+            "Match saved | job_id=%s | candidate_id=%s | stale=%s | saved_match_score=%s | saved_match_percentage=%s",
+            saved_row[0],
+            saved_row[1],
+            bool(saved_row[4]),
+            saved_match.get("match_score"),
+            saved_match.get("match_percentage"),
+        )
+    else:
+        matcher_logger.warning("Match save verification failed | job_id=%s | candidate_id=%s", job_id, candidate_id)
+
+
+def _mark_match_stale(job_id: int, candidate_id: int) -> None:
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        UPDATE match_cache
+        SET is_stale = 1,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE job_id = ? AND candidate_id = ?
+    """, (job_id, candidate_id))
+    conn.commit()
+    conn.close()
+
+
+def touch_job_match_staleness(job_id: int) -> None:
+    """Mark any cached match rows for a job as stale after the source job changes."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        UPDATE match_cache
+        SET is_stale = 1,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE job_id = ?
+    """, (job_id,))
+    conn.commit()
+    conn.close()
+
+
+def touch_candidate_match_staleness(candidate_id: int) -> None:
+    """Mark any cached match rows for a candidate as stale after a new upload."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        UPDATE match_cache
+        SET is_stale = 1,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE candidate_id = ?
+    """, (candidate_id,))
+    conn.commit()
+    conn.close()
+
+
+def _qwen_final_review(job: dict, candidate: dict, python_match: dict) -> dict:
+    client = _create_qwen_client()
+    if client is None:
+        return {}
+
+    prompt = f"""
+You are a recruiter doing a final review after Python pre-ranking.
+Return ONLY valid JSON and nothing else.
+
+Schema:
+{{
+  "final_match_score": 0,
+  "explanation": "",
+  "strengths": [],
+  "gaps": [],
+  "recommendation": "weak match"
+}}
+
+Rules:
+- final_match_score must be 0-100.
+- recommendation must be exactly one of: strong match, possible match, weak match.
+- Keep the response concise and recruiter-style.
+- Base the review on the job, candidate, and Python pre-score.
+- Do not invent experience or skills.
+
+Job:
+{json.dumps(_job_match_context(job), ensure_ascii=True)}
+
+Candidate:
+{json.dumps(_candidate_match_context(candidate), ensure_ascii=True)}
+
+Python pre-score:
+{json.dumps(python_match, ensure_ascii=True)}
+"""
+
+    try:
+        response = client.chat.completions.create(
+            model=DEFAULT_QWEN_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.0,
+        )
+        raw_response = response.choices[0].message.content or ""
+        parsed = _extract_json_object(raw_response)
+    except Exception:
+        return {}
+
+    python_score = int(python_match.get("match_score", 0) or 0)
+    score_value = parsed.get("final_match_score", parsed.get("score", parsed.get("match_score", parsed.get("match_percentage", None))))
+    score, original_score_value = _normalize_qwen_score(score_value, python_score)
+    matcher_logger.info(
+        "Qwen review parsed | job_id=%s | candidate_id=%s | python_match_score=%s | qwen_raw_response=%s | qwen_parsed_score=%s",
+        job.get("id"),
+        candidate.get("id"),
+        python_score,
+        _compact_text(raw_response, 240),
+        score,
+    )
+
+    return {
+        "match_source": "Qwen Final Review",
+        "match_score": score,
+        "match_percentage": score,
+        "match_level": _normalize_match_level(score),
+        "matched_skills": _safe_string_list(parsed.get("strengths")) or python_match.get("matched_skills", []),
+        "missing_skills": _safe_string_list(parsed.get("gaps")) or python_match.get("missing_skills", []),
+        "strengths": _safe_string_list(parsed.get("strengths")) or python_match.get("strengths", []),
+        "gaps": _safe_string_list(parsed.get("gaps")) or python_match.get("gaps", []),
+        "qwen_final_review": {
+            "explanation": _compact_text(parsed.get("explanation"), 1200),
+            "strengths": _safe_string_list(parsed.get("strengths")),
+            "gaps": _safe_string_list(parsed.get("gaps")),
+            "recommendation": _normalize_recommendation(parsed.get("recommendation"), score),
+            "raw_final_match_score": original_score_value,
+        },
+        "recruiter_summary": _compact_text(parsed.get("explanation"), 1200) or python_match.get("recruiter_summary", ""),
+        "recommended_action": _normalize_recommendation(parsed.get("recommendation"), score),
+    }
+
+
+def apply_qwen_final_review(job: dict, candidate: dict, python_match: dict) -> dict:
+    """Run the optional Qwen review step for a pre-ranked candidate."""
+    review = _qwen_final_review(job, candidate, python_match)
+    if not review:
+        return python_match
+
+    merged = {**python_match, **review}
+    matcher_logger.info(
+        "Final score before save | job_id=%s | candidate_id=%s | score=%s | percentage=%s",
+        job.get("id"),
+        candidate.get("id"),
+        merged.get("match_score"),
+        merged.get("match_percentage"),
+    )
+    _store_cached_match(
+        job.get("id"),
+        candidate.get("id"),
+        _fingerprint(_job_match_context(job)),
+        _fingerprint(_candidate_match_context(candidate)),
+        merged,
+    )
+    return merged
 
 
 def get_analytics_summary():
@@ -625,6 +1495,9 @@ def _row_to_job(row: sqlite3.Row | dict | None) -> dict | None:
     job = dict(row)
     required_skills = split_job_skills(job.get("required_skills"))
     job["required_skills_list"] = required_skills
+    job["preferred_skills_list"] = split_job_skills(job.get("preferred_skills"))
+    job["certifications_list"] = _split_certifications(job.get("certifications"))
+    job["keywords_list"] = _simple_keywords(job.get("keywords"), 18)
     return job
 
 
@@ -649,11 +1522,16 @@ def create_job(job_data: dict, user_email: str | None) -> int:
             status,
             description,
             required_skills,
+            preferred_skills,
+            years_required,
+            industry,
+            certifications,
+            keywords,
             salary,
             created_by,
             updated_by
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
         job_id,
         job_data.get("title", "").strip(),
@@ -663,6 +1541,11 @@ def create_job(job_data: dict, user_email: str | None) -> int:
         job_data.get("status", "open").strip().lower(),
         job_data.get("description", "").strip(),
         job_data.get("required_skills", "").strip(),
+        job_data.get("preferred_skills", "").strip(),
+        job_data.get("years_required", "").strip(),
+        job_data.get("industry", "").strip(),
+        job_data.get("certifications", "").strip(),
+        job_data.get("keywords", "").strip(),
         job_data.get("salary", "").strip(),
         user_email,
         user_email,
@@ -671,6 +1554,8 @@ def create_job(job_data: dict, user_email: str | None) -> int:
     created_id = cursor.lastrowid
     conn.commit()
     conn.close()
+    touch_job_match_staleness(created_id)
+    db_logger.info("Job inserted (ID=%s)", created_id)
 
     return created_id
 
@@ -688,6 +1573,11 @@ def update_job(job_pk: int, job_data: dict, user_email: str | None) -> bool:
             status = ?,
             description = ?,
             required_skills = ?,
+            preferred_skills = ?,
+            years_required = ?,
+            industry = ?,
+            certifications = ?,
+            keywords = ?,
             salary = ?,
             updated_by = ?,
             updated_at = CURRENT_TIMESTAMP
@@ -700,6 +1590,11 @@ def update_job(job_pk: int, job_data: dict, user_email: str | None) -> bool:
         job_data.get("status", "open").strip().lower(),
         job_data.get("description", "").strip(),
         job_data.get("required_skills", "").strip(),
+        job_data.get("preferred_skills", "").strip(),
+        job_data.get("years_required", "").strip(),
+        job_data.get("industry", "").strip(),
+        job_data.get("certifications", "").strip(),
+        job_data.get("keywords", "").strip(),
         job_data.get("salary", "").strip(),
         user_email,
         job_pk,
@@ -708,6 +1603,9 @@ def update_job(job_pk: int, job_data: dict, user_email: str | None) -> bool:
     updated = cursor.rowcount > 0
     conn.commit()
     conn.close()
+    if updated:
+        touch_job_match_staleness(job_pk)
+        db_logger.info("Job updated (ID=%s)", job_pk)
 
     return updated
 
@@ -720,6 +1618,8 @@ def delete_job(job_pk: int) -> bool:
     deleted = cursor.rowcount > 0
     conn.commit()
     conn.close()
+    if deleted:
+        db_logger.info("Job deleted (ID=%s)", job_pk)
 
     return deleted
 
@@ -731,7 +1631,8 @@ def get_job_by_id(job_identifier: int | str):
 
     cursor.execute("""
         SELECT id, job_id, title, department, location, job_type, status, description,
-            required_skills, salary, created_by, updated_by, created_at, updated_at
+            required_skills, preferred_skills, years_required, industry, certifications, keywords,
+            salary, created_by, updated_by, created_at, updated_at
         FROM jobs
         WHERE id = ? OR job_id = ?
     """, (job_identifier, str(job_identifier)))
@@ -742,26 +1643,36 @@ def get_job_by_id(job_identifier: int | str):
     return _row_to_job(row)
 
 
-def calculate_job_match(job: dict, candidate: dict) -> dict:
-    required_skills = split_job_skills(job.get("required_skills"))
-    candidate_skills = split_normalized_skills(candidate.get("normalized_skills")) or split_normalized_skills(candidate.get("skills"))
-    candidate_skill_keys = {normalize_skill_key(skill) for skill in candidate_skills}
+def calculate_job_match(job: dict, candidate: dict, *, use_cache: bool = True, force_refresh: bool = False, persist: bool = True) -> dict:
+    matcher_logger.debug("Matching score calculated | job_id=%s | candidate_id=%s", job.get("id"), candidate.get("id"))
+    python_match = _create_python_match(job, candidate)
+    job_fingerprint = _fingerprint(_job_match_context(job))
+    candidate_fingerprint = _fingerprint(_candidate_match_context(candidate))
 
-    matched_skills = []
-    missing_skills = []
-    for skill in required_skills:
-        skill_key = normalize_skill_key(skill)
-        if skill_key and skill_key in candidate_skill_keys:
-            matched_skills.append(skill)
-        else:
-            missing_skills.append(skill)
+    if use_cache and not force_refresh:
+        cached_match = _get_cached_match(job.get("id"), candidate.get("id"), job_fingerprint, candidate_fingerprint)
+        if cached_match and not cached_match.get("is_stale"):
+            python_match = {**python_match, **cached_match}
+            python_match["cached"] = True
+            python_match["is_cached"] = True
+            return {
+                "candidate_id": candidate.get("id"),
+                "candidate_name": candidate.get("candidate"),
+                "current_position": candidate.get("current_position"),
+                "current_company": candidate.get("current_company"),
+                "location": candidate.get("location") or "Not found",
+                "years_experience": candidate.get("total_experience_years"),
+                **python_match,
+            }
 
-    if required_skills:
-        match_percentage = round((len(matched_skills) / len(required_skills)) * 100)
-    else:
-        title_text = normalize_skill_key(job.get("title"))
-        role_text = normalize_skill_key(candidate.get("current_position"))
-        match_percentage = 50 if title_text and title_text in role_text else 0
+    if persist:
+        _store_cached_match(
+            job.get("id"),
+            candidate.get("id"),
+            job_fingerprint,
+            candidate_fingerprint,
+            python_match,
+        )
 
     return {
         "candidate_id": candidate.get("id"),
@@ -770,28 +1681,259 @@ def calculate_job_match(job: dict, candidate: dict) -> dict:
         "current_company": candidate.get("current_company"),
         "location": candidate.get("location") or "Not found",
         "years_experience": candidate.get("total_experience_years"),
-        "matched_skills": matched_skills,
-        "missing_skills": missing_skills,
-        "match_percentage": int(match_percentage),
+        **python_match,
     }
 
 
-def get_job_matches(job_identifier: int | str):
+def get_scraped_job_matches(job_identifier: int | str, *, refresh: bool = False):
+    with get_connection() as conn:
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT id, title, department, location, employment_type, job_number, salary, description, url, active, last_scraped, source, company
+            FROM scraped_jobs
+            WHERE id = ?
+        """, (job_identifier,))
+        job_row = cursor.fetchone()
+
+    if not job_row:
+        return None
+
+    job = dict(job_row)
+    candidates = get_candidates()
+    if not candidates:
+        return {"job": job, "matches": [], "total_resumes": 0, "strong_matches": []}
+
+    synthetic_job = {
+        "id": job["id"],
+        "title": job["title"],
+        "department": job.get("department", ""),
+        "location": job.get("location", ""),
+        "job_type": job.get("employment_type", ""),
+        "status": "open" if job.get("active", 1) else "closed",
+        "description": job.get("description", ""),
+        "required_skills": job.get("required_skills", "") or job.get("title", ""),
+        "preferred_skills": job.get("preferred_skills", ""),
+        "years_required": "",
+        "industry": job.get("department", "") or job.get("industry", ""),
+        "certifications": job.get("certifications", ""),
+        "keywords": job.get("keywords", "") or f"{job.get('title', '')} {job.get('department', '')}",
+        "salary": job.get("salary", ""),
+    }
+
+    matches = []
+    job_context = _job_match_context(synthetic_job)
+    job_fingerprint = _fingerprint(job_context)
+
+    for candidate in candidates:
+        candidate_context = _candidate_match_context(candidate)
+        candidate_fingerprint = _fingerprint(candidate_context)
+        cached_match = None if refresh else _get_cached_match(synthetic_job.get("id"), candidate.get("id"), job_fingerprint, candidate_fingerprint)
+        if cached_match and not cached_match.get("is_stale"):
+            matches.append({
+                "candidate_id": candidate.get("id"),
+                "candidate_name": candidate.get("candidate"),
+                "current_position": candidate.get("current_position"),
+                "current_company": candidate.get("current_company"),
+                "location": candidate.get("location") or "Not found",
+                "years_experience": candidate.get("total_experience_years"),
+                **cached_match,
+                "cached": True,
+                "is_cached": True,
+            })
+            continue
+
+        if cached_match and cached_match.get("is_stale"):
+            matcher_logger.info("Stale match | job_id=%s | candidate_id=%s", synthetic_job.get("id"), candidate.get("id"))
+
+        matches.append(
+            calculate_job_match(
+                synthetic_job,
+                candidate,
+                use_cache=not refresh,
+                force_refresh=refresh,
+                persist=True,
+            )
+        )
+
+    matches.sort(key=lambda match: match["match_score"], reverse=True)
+
+    for match in matches[:TOP_QWEN_MATCHES]:
+        candidate = next((item for item in candidates if item.get("id") == match["candidate_id"]), None)
+        if not candidate:
+            continue
+        if refresh or match.get("match_source") != "Qwen Final Review" or not match.get("qwen_final_review"):
+            review = apply_qwen_final_review(synthetic_job, candidate, match)
+            if review:
+                match.update(review)
+            else:
+                matcher_logger.info("Qwen fallback used | job_id=%s | candidate_id=%s", synthetic_job.get("id"), candidate.get("id"))
+    for match in matches[TOP_QWEN_MATCHES:]:
+        if match.get("match_source") != "Qwen Final Review":
+            match["match_source"] = "Python Match"
+            match["recruiter_summary"] = "Not sent to Qwen because initial Python ranking was lower."
+
+    if matches:
+        api_match = matches[0]
+        matcher_logger.info(
+            "API response match | job_id=%s | candidate_id=%s | api_response_match_score=%s | api_response_match_percentage=%s",
+            api_match.get("job_id", synthetic_job.get("id")),
+            api_match.get("candidate_id"),
+            api_match.get("match_score"),
+            api_match.get("match_percentage"),
+        )
+
+    return {
+        "job": job,
+        "job_id": job.get("id"),
+        "matches": matches,
+        "total_resumes": len(candidates),
+        "strong_matches": [match for match in matches if match["match_score"] >= 70],
+    }
+
+
+def get_job_matches(job_identifier: int | str, *, refresh: bool = False, force_llm: bool = False):
     job = get_job_by_id(job_identifier)
     if not job:
         return None
 
-    matches = [
-        calculate_job_match(job, candidate)
-        for candidate in get_candidates()
-    ]
-    matches.sort(key=lambda match: match["match_percentage"], reverse=True)
+    candidates = get_candidates()
+    if not candidates:
+        return {"job": job, "matches": [], "top_matches": []}
+
+    matches = []
+    job_context = _job_match_context(job)
+    job_fingerprint = _fingerprint(job_context)
+
+    for candidate in candidates:
+        matcher_logger.debug("Current candidate being evaluated | job_id=%s | candidate_id=%s", job.get("id"), candidate.get("id"))
+        candidate_context = _candidate_match_context(candidate)
+        candidate_fingerprint = _fingerprint(candidate_context)
+        cached_match = None if refresh else _get_cached_match(job.get("id"), candidate.get("id"), job_fingerprint, candidate_fingerprint)
+        if cached_match and not cached_match.get("is_stale"):
+            matches.append({
+                "candidate_id": candidate.get("id"),
+                "candidate_name": candidate.get("candidate"),
+                "current_position": candidate.get("current_position"),
+                "current_company": candidate.get("current_company"),
+                "location": candidate.get("location") or "Not found",
+                "years_experience": candidate.get("total_experience_years"),
+                **cached_match,
+            })
+            continue
+
+        matches.append(calculate_job_match(job, candidate, use_cache=False, force_refresh=True))
+    matches.sort(key=lambda match: match["match_score"], reverse=True)
+
+    for match in matches[:TOP_QWEN_MATCHES]:
+        candidate = next((item for item in candidates if item.get("id") == match["candidate_id"]), None)
+        if not candidate:
+            continue
+        if refresh or match.get("match_source") != "Qwen Final Review" or not match.get("qwen_final_review"):
+            match.update(apply_qwen_final_review(job, candidate, match))
+    for match in matches[TOP_QWEN_MATCHES:]:
+        if match.get("match_source") != "Qwen Final Review":
+            match["match_source"] = "Python Match"
+            match["recruiter_summary"] = "Not sent to Qwen because initial Python ranking was lower."
 
     return {
         "job": job,
+        "job_id": job.get("id"),
         "matches": matches,
-        "top_matches": [match for match in matches if match["match_percentage"] >= 70],
+        "top_matches": [match for match in matches if match["match_score"] >= 70],
     }
+
+
+def get_scraped_jobs():
+    conn = get_connection()
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        SELECT
+            id,
+            title,
+            location,
+            department,
+            employment_type,
+            job_number,
+            salary,
+            description,
+            url,
+            active,
+            last_scraped,
+            source,
+            company,
+            responsibilities,
+            qualifications,
+            benefits,
+            apply_email_or_link
+        FROM scraped_jobs
+        WHERE COALESCE(active, 1) = 1
+        ORDER BY id DESC
+    """)
+    jobs = [dict(row) for row in cursor.fetchall()]
+
+    cursor.execute("SELECT COUNT(*) AS total_candidates FROM candidates")
+    total_candidates_row = cursor.fetchone()
+    total_candidates = total_candidates_row["total_candidates"] if total_candidates_row else 0
+
+    cursor.execute("""
+        SELECT COUNT(*) AS strong_matches
+        FROM match_cache mc
+        JOIN candidates c ON c.id = mc.candidate_id
+        JOIN scraped_jobs sj ON sj.id = mc.job_id
+        WHERE mc.is_stale = 0
+          AND COALESCE(sj.active, 1) = 1
+          AND COALESCE(
+                CAST(json_extract(mc.match_json, '$.match_score') AS REAL),
+                CAST(json_extract(mc.match_json, '$.match_percentage') AS REAL)
+          ) >= 75
+    """)
+    strong_matches_row = cursor.fetchone()
+    strong_matches = strong_matches_row["strong_matches"] if strong_matches_row else 0
+
+    cursor.execute("""
+        SELECT COUNT(*) AS valid_cache_rows
+        FROM match_cache mc
+        JOIN candidates c ON c.id = mc.candidate_id
+        JOIN scraped_jobs sj ON sj.id = mc.job_id
+        WHERE mc.is_stale = 0
+          AND COALESCE(sj.active, 1) = 1
+    """)
+    valid_cache_row = cursor.fetchone()
+    valid_cache_rows = valid_cache_row["valid_cache_rows"] if valid_cache_row else 0
+
+    cursor.execute("""
+        SELECT COUNT(*) AS open_jobs
+        FROM scraped_jobs
+        WHERE COALESCE(active, 1) = 1
+    """)
+    open_jobs_row = cursor.fetchone()
+    open_jobs = open_jobs_row["open_jobs"] if open_jobs_row else 0
+
+    conn.close()
+
+    summary = {
+        "total_jobs": len(jobs),
+        "open_jobs": open_jobs,
+        "active_candidates": total_candidates,
+        "strong_matches": strong_matches,
+        "offers_sent": 0,
+        "average_time_to_fill": "N/A",
+    }
+    matcher_logger.info(
+        "Job board summary | db_path=%s | candidate_count=%s | scraped_job_count=%s | active_job_count=%s | valid_cache_row_count=%s | strong_match_count=%s | score_column=%s | strong_match_threshold=%s",
+        DB_PATH,
+        total_candidates,
+        len(jobs),
+        open_jobs,
+        valid_cache_rows,
+        strong_matches,
+        "match_score/match_percentage",
+        75,
+    )
+    return {"jobs": jobs, "summary": summary}
 
 
 def get_jobs():
@@ -815,22 +1957,17 @@ def get_jobs():
     offers_sent = 0
 
     for job in jobs:
-        match_data = get_job_matches(job["id"]) or {"matches": []}
-        matches = match_data["matches"]
-        top_match_percentage = matches[0]["match_percentage"] if matches else 0
-        strong_match_count = len([match for match in matches if match["match_percentage"] >= 70])
         normalized_status = str(job.get("status") or "").lower()
         if normalized_status == "open":
             open_jobs += 1
         if normalized_status in {"offer", "offer sent", "offers sent"}:
             offers_sent += 1
-        all_top_match_counts += strong_match_count
 
         enriched_jobs.append({
             **job,
             "applicants": candidate_count,
-            "top_match_percentage": top_match_percentage,
-            "strong_match_count": strong_match_count,
+            "top_match_percentage": 0,
+            "strong_match_count": 0,
         })
 
     return {
@@ -878,6 +2015,7 @@ def update_user(user_id: int, name: str, username: str, email: str, role: str) -
 
     conn.commit()
     conn.close()
+    db_logger.info("User updated | user_id=%s | email=%s | role=%s", user_id, email, normalized_role)
 
 
 def reset_user_password(user_id: int, password_hash: str) -> None:
@@ -892,6 +2030,7 @@ def reset_user_password(user_id: int, password_hash: str) -> None:
 
     conn.commit()
     conn.close()
+    db_logger.info("Password reset | user_id=%s", user_id)
 
 
 def set_user_lock_status(user_id: int, is_locked: bool) -> None:
@@ -906,6 +2045,7 @@ def set_user_lock_status(user_id: int, is_locked: bool) -> None:
 
     conn.commit()
     conn.close()
+    db_logger.info("Account %s | user_id=%s", "locked" if is_locked else "unlocked", user_id)
 
 
 def mark_user_login(user_id: int) -> None:
@@ -920,6 +2060,7 @@ def mark_user_login(user_id: int) -> None:
 
     conn.commit()
     conn.close()
+    db_logger.info("User login marked | user_id=%s", user_id)
 
 
 def delete_user_record(user_id: int) -> bool:
@@ -934,6 +2075,8 @@ def delete_user_record(user_id: int) -> bool:
     deleted = cursor.rowcount > 0
     conn.commit()
     conn.close()
+    if deleted:
+        db_logger.info("User deleted | user_id=%s", user_id)
 
     return deleted
 
@@ -1090,6 +2233,8 @@ def delete_candidate(candidate_id: int) -> bool:
     deleted = cursor.rowcount > 0
     conn.commit()
     conn.close()
+    if deleted:
+        db_logger.info("Candidate deleted (ID=%s)", candidate_id)
 
     return deleted
 

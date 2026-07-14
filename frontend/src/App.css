@@ -1394,7 +1394,7 @@ tbody tr:hover .actions-column {
 
 .job-filters {
   display: grid;
-  grid-template-columns: minmax(240px, 1.4fr) repeat(4, minmax(130px, 1fr));
+  grid-template-columns: minmax(240px, 1.4fr) repeat(5, minmax(130px, 1fr));
   gap: 12px;
   align-items: end;
 }
@@ -1420,6 +1420,13 @@ tbody tr:hover .actions-column {
 .job-table th:nth-child(5),
 .job-table td:nth-child(5) {
   text-align: center;
+}
+
+.job-table th:nth-child(2),
+.job-table td:nth-child(2),
+.job-table th:nth-child(3),
+.job-table td:nth-child(3) {
+  text-align: left;
 }
 
 .job-title-button {

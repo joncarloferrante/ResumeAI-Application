@@ -1,14 +1,16 @@
-from fastapi import Cookie, Depends, FastAPI, Response, UploadFile, File, HTTPException
+from fastapi import Cookie, Depends, FastAPI, Response, UploadFile, File, HTTPException, Query, Request
 from pathlib import Path
 import base64
 import hashlib
 import hmac
 import json
 import os
+import logging
 import re
 import shutil
 import sqlite3
 import time
+import threading
 from dotenv import load_dotenv
 load_dotenv()
 
@@ -16,6 +18,7 @@ from auth_utils import hash_password, verify_password
 from resume_parser import parse_resume_file
 from database import (
     create_audit_log,
+    apply_qwen_final_review,
     create_user,
     calculate_job_match,
     delete_candidate,
@@ -29,6 +32,8 @@ from database import (
     get_connection,
     get_user_by_email,
     get_user_by_id,
+    get_scraped_jobs,
+    get_scraped_job_matches,
     mark_user_login,
     init_db,
     reset_user_password,
@@ -40,6 +45,17 @@ from database import (
 )
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+from logging_config import configure_logging, get_logger
+
+configure_logging()
+logger = get_logger("main")
+api_logger = get_logger("api")
+auth_logger = get_logger("auth")
+upload_logger = get_logger("upload")
+parser_logger = get_logger("parser")
+file_logger = get_logger("file")
+user_logger = get_logger("users")
+startup_logger = get_logger("startup")
 
 app = FastAPI()
 app.add_middleware(
@@ -55,11 +71,25 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    start = time.perf_counter()
+    response = await call_next(request)
+    duration_ms = int((time.perf_counter() - start) * 1000)
+    api_logger.info("%s %s completed in %s ms (%s)", request.method, request.url.path, duration_ms, response.status_code)
+    return response
+
+startup_logger.info("Backend starting...")
+db_start = time.perf_counter()
 init_db()
+startup_logger.info("Database initialization complete in %.2f seconds", time.perf_counter() - db_start)
+startup_logger.info("API routes loaded")
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 UPLOAD_DIR = PROJECT_ROOT / "uploads"
-UPLOAD_DIR.mkdir(exist_ok=True)
+if not UPLOAD_DIR.exists():
+    UPLOAD_DIR.mkdir(exist_ok=True)
+    file_logger.info("Upload directory created | path=%s", UPLOAD_DIR)
 SESSION_COOKIE_NAME = "resumeai_session"
 SESSION_MAX_AGE_SECONDS = 60 * 60 * 8
 SESSION_SECRET = os.environ.get("RESUMEAI_SESSION_SECRET", "dev-only-change-me")
@@ -216,34 +246,32 @@ def delete_uploaded_resume_file(filename: str | None) -> bool:
 
     if candidate_path.is_file():
         candidate_path.unlink()
+        file_logger.info("Resume deleted | filename=%s", filename)
         return True
 
+    file_logger.warning("File not found | filename=%s", filename)
     return False
 
 
 def log_parsed_resume_debug(filename: str, parsed_data: dict) -> None:
-    """Temporary upload pipeline logging for inspecting parser output."""
-    debug_fields = {
-        "filename": filename,
-        "candidate": parsed_data.get("Candidate"),
-        "email": parsed_data.get("Email"),
-        "phone": parsed_data.get("Phone Number"),
-        "current_position": parsed_data.get("Current Position"),
-        "current_company": parsed_data.get("Current Company"),
-        "total_experience_years": parsed_data.get("Total Experience (Years)"),
-        "career_span_years": parsed_data.get("Career Span (Years)"),
-        "skills": parsed_data.get("Skills"),
-        "normalized_skills": parsed_data.get("Normalized Skills"),
-        "resume_summary": parsed_data.get("Resume Summary"),
-    }
-    print(f"[resume-upload-debug] parsed_data={json.dumps(debug_fields, default=str)}", flush=True)
+    """Structured summary of parsed output without raw resume text."""
+    parser_logger.debug(
+        "Candidate extracted | filename=%s | candidate=%s | email=%s | current_position=%s | current_company=%s",
+        filename,
+        parsed_data.get("Candidate"),
+        parsed_data.get("Email"),
+        parsed_data.get("Current Position"),
+        parsed_data.get("Current Company"),
+    )
 
 
 def get_current_user(resumeai_session: str | None = Cookie(default=None, alias=SESSION_COOKIE_NAME)):
     user = get_user_from_session(resumeai_session)
     if not user:
+        auth_logger.warning("Unauthorized access attempt")
         raise HTTPException(status_code=401, detail="Not authenticated")
     if user.get("is_locked"):
+        auth_logger.warning("Locked account access denied | user_id=%s | email=%s", user.get("id"), user.get("email"))
         raise HTTPException(status_code=401, detail="Account is locked")
 
     return user
@@ -261,6 +289,7 @@ def get_user_from_session(resumeai_session: str | None):
 
 def require_admin(current_user: dict = Depends(get_current_user)):
     if current_user.get("role") != "admin":
+        auth_logger.warning("Role-based access denied | user_id=%s | email=%s | role=%s", current_user.get("id"), current_user.get("email"), current_user.get("role"))
         raise HTTPException(status_code=403, detail="Admins only")
 
     return current_user
@@ -277,6 +306,7 @@ def register(credentials: AuthCredentials, response: Response):
         raise HTTPException(status_code=403, detail="Registration is disabled.")
 
     email = normalize_email(credentials.email)
+    auth_logger.info("Login attempt via registration | email=%s", email)
 
     if len(credentials.password) < 8:
         raise HTTPException(status_code=400, detail="Password must be at least 8 characters.")
@@ -295,23 +325,28 @@ def register(credentials: AuthCredentials, response: Response):
 @app.post("/auth/login")
 def login(credentials: AuthCredentials, response: Response):
     email = normalize_email(credentials.email)
+    auth_logger.info("Login attempt | email=%s", email)
     user = get_user_by_email(email)
 
     if not user:
         create_audit_log(email, "Login", "Invalid email or password.", "failed")
+        auth_logger.warning("Failed login | email=%s | reason=unknown user", email)
         raise HTTPException(status_code=401, detail="Invalid email or password.")
 
     if user.get("is_locked"):
         create_audit_log(user["email"], "Login", "Account is locked.", "denied")
+        auth_logger.warning("Failed login | email=%s | reason=locked", user["email"])
         raise HTTPException(status_code=403, detail="Account is locked.")
 
     if not verify_password(credentials.password, user["password_hash"]):
         create_audit_log(email, "Login", "Invalid email or password.", "failed")
+        auth_logger.warning("Failed login | email=%s | reason=invalid password", email)
         raise HTTPException(status_code=401, detail="Invalid email or password.")
 
     set_session_cookie(response, user["id"])
     mark_user_login(user["id"])
     create_audit_log(user["email"], "Login", "User signed in.", "success")
+    auth_logger.info("Successful login | user_id=%s | email=%s", user["id"], user["email"])
 
     return {"user": public_user(get_user_by_id(user["id"]))}
 
@@ -324,6 +359,7 @@ def logout(
     user = get_user_from_session(resumeai_session)
     if user:
         create_audit_log(user["email"], "Logout", "User signed out.", "success")
+        auth_logger.info("Logout | user_id=%s | email=%s", user.get("id"), user.get("email"))
 
     clear_session_cookie(response)
     return {"status": "logged_out"}
@@ -375,6 +411,7 @@ def create_user_account(payload: UserCreatePayload, current_user: dict = Depends
         },
         "success",
     )
+    user_logger.info("User created | user_id=%s | email=%s | role=%s", user_id, created_user.get("email"), created_user.get("role"))
     return public_user(created_user)
 
 
@@ -422,6 +459,7 @@ def update_user_account(user_id: int, payload: UserUpdatePayload, current_user: 
         },
         "success",
     )
+    user_logger.info("User updated | user_id=%s | email=%s | role=%s", user_id, updated_user.get("email"), updated_user.get("role"))
     return public_user(updated_user)
 
 
@@ -446,6 +484,7 @@ def reset_password(user_id: int, payload: PasswordResetPayload, current_user: di
         },
         "success",
     )
+    user_logger.info("Password reset | user_id=%s | email=%s", user_id, existing_user.get("email"))
     return {"status": "password_reset"}
 
 
@@ -470,6 +509,7 @@ def lock_user(user_id: int, current_user: dict = Depends(require_admin)):
         },
         "success",
     )
+    user_logger.info("Account locked | user_id=%s | email=%s", user_id, existing_user.get("email"))
     return {"status": "locked"}
 
 
@@ -491,6 +531,7 @@ def unlock_user(user_id: int, current_user: dict = Depends(require_admin)):
         },
         "success",
     )
+    user_logger.info("Account unlocked | user_id=%s | email=%s", user_id, existing_user.get("email"))
     return {"status": "unlocked"}
 
 
@@ -519,6 +560,7 @@ def remove_user(user_id: int, current_user: dict = Depends(require_admin)):
         },
         "success",
     )
+    user_logger.info("User deleted | user_id=%s | email=%s", user_id, existing_user.get("email"))
     return {"status": "deleted"}
 
 
@@ -529,7 +571,17 @@ def security_dashboard(current_user: dict = Depends(require_admin)):
 
 @app.post("/upload")
 async def upload_resume(file: UploadFile = File(...), current_user: dict = Depends(get_current_user)):
+    upload_logger.info(
+        "Upload started | user_id=%s | filename=%s | content_type=%s",
+        current_user.get("id"),
+        file.filename,
+        file.content_type,
+    )
     save_path = UPLOAD_DIR / file.filename
+    file.file.seek(0, os.SEEK_END)
+    file_size = file.file.tell()
+    file.file.seek(0)
+    upload_logger.info("Uploaded filename=%s | size=%s bytes | type=%s", file.filename, file_size, file.content_type)
 
     with save_path.open("wb") as buffer:
         shutil.copyfileobj(file.file, buffer)
@@ -542,10 +594,13 @@ async def upload_resume(file: UploadFile = File(...), current_user: dict = Depen
             {"filename": file.filename, "reason": DUPLICATE_RESUME_MESSAGE},
             "failed",
         )
+        upload_logger.warning("Upload failed | filename=%s | reason=duplicate", file.filename)
         raise HTTPException(status_code=409, detail=DUPLICATE_RESUME_MESSAGE)
 
     try:
+        parser_logger.info("Parsing started | filename=%s", file.filename)
         parsed_data = parse_resume_file(save_path)
+        parser_logger.info("Parsing completed | filename=%s", file.filename)
     except Exception as exc:
         create_audit_log(
             current_user["email"],
@@ -553,6 +608,7 @@ async def upload_resume(file: UploadFile = File(...), current_user: dict = Depen
             {"filename": file.filename, "reason": str(exc)},
             "failed",
         )
+        upload_logger.exception("Upload failed | filename=%s", file.filename)
         raise HTTPException(status_code=400, detail=str(exc))
 
     log_parsed_resume_debug(file.filename, parsed_data)
@@ -565,6 +621,7 @@ async def upload_resume(file: UploadFile = File(...), current_user: dict = Depen
             {"filename": file.filename, "reason": DUPLICATE_RESUME_MESSAGE},
             "failed",
         )
+        upload_logger.warning("Upload failed | filename=%s | reason=duplicate after parse", file.filename)
         raise HTTPException(status_code=409, detail=DUPLICATE_RESUME_MESSAGE)
 
     create_audit_log(
@@ -573,6 +630,7 @@ async def upload_resume(file: UploadFile = File(...), current_user: dict = Depen
         {"candidate_id": candidate_id, "filename": file.filename},
         "success",
     )
+    upload_logger.info("Upload completed | filename=%s | candidate_id=%s", file.filename, candidate_id)
 
     return {
         "filename": file.filename,
@@ -679,85 +737,39 @@ def list_audit_logs(current_user: dict = Depends(get_current_user)):
 
 @app.get("/api/scraped-jobs")
 def list_scraped_jobs():
-    with get_connection() as conn:
-        conn.row_factory = sqlite3.Row
-        cursor = conn.cursor()
-        cursor.execute("""
-            SELECT
-                id,
-                title,
-                location,
-                department,
-                employment_type,
-                job_number,
-                salary,
-                description,
-                url,
-                active,
-                last_scraped
-            FROM scraped_jobs
-            WHERE COALESCE(active, 1) = 1
-            ORDER BY id DESC
-        """)
-        rows = [dict(row) for row in cursor.fetchall()]
-
-    return {"jobs": rows}
+    return get_scraped_jobs()
 
 
 @app.get("/api/scraped-jobs/{job_id}/matches")
-def list_scraped_job_matches(job_id: int):
-    with get_connection() as conn:
-        conn.row_factory = sqlite3.Row
-        cursor = conn.cursor()
+def list_scraped_job_matches(job_id: int, refresh: bool = Query(default=False)):
+    matcher_logger = get_logger("matcher")
+    matcher_logger.info("Matching started | job_id=%s | refresh=%s", job_id, refresh)
+    with _job_match_locks_guard:
+        job_lock = _job_match_locks.setdefault(job_id, threading.Lock())
 
-        cursor.execute("""
-            SELECT id, title, department, location, employment_type, job_number, salary, description, url, active, last_scraped
-            FROM scraped_jobs
-            WHERE id = ?
-        """, (job_id,))
-        job_row = cursor.fetchone()
+    if not job_lock.acquire(blocking=False):
+        matcher_logger.info("Duplicate processing prevented | job_id=%s", job_id)
+        with job_lock:
+            pass
+        result = get_scraped_job_matches(job_id, refresh=False)
+        if not result:
+            raise HTTPException(status_code=404, detail="Scraped job not found")
+        return result
 
-    if not job_row:
-        raise HTTPException(status_code=404, detail="Scraped job not found")
+    try:
+        if refresh:
+            matcher_logger.info("Recalculation requested | job_id=%s", job_id)
+        result = get_scraped_job_matches(job_id, refresh=refresh)
+        if not result:
+            raise HTTPException(status_code=404, detail="Scraped job not found")
+        return result
+    finally:
+        job_lock.release()
 
-    scraped_job = dict(job_row)
-    candidates = get_candidates()
-    if not candidates:
-        return {
-            "job": scraped_job,
-            "matches": [],
-            "total_resumes": 0,
-            "strong_matches": [],
-        }
 
-    # Reuse the existing match calculator by turning the scraped job title and department into a keyword list.
-    required_skills = ", ".join(
-        dict.fromkeys(
-            part
-            for part in re.split(r"[\s,/|-]+", f"{scraped_job.get('title', '')} {scraped_job.get('department', '')}")
-            if part and len(part) > 2
-        )
-    )
-    synthetic_job = {
-        "id": scraped_job["id"],
-        "title": scraped_job["title"],
-        "department": scraped_job.get("department", ""),
-        "location": scraped_job.get("location", ""),
-        "job_type": scraped_job.get("employment_type", ""),
-        "status": "open" if scraped_job.get("active", 1) else "closed",
-        "description": scraped_job.get("description", ""),
-        "required_skills": required_skills,
-        "salary": scraped_job.get("salary", ""),
-    }
+@app.on_event("startup")
+async def announce_server_ready():
+    startup_logger.info("Server ready")
 
-    matches = [calculate_job_match(synthetic_job, candidate) for candidate in candidates]
-    matches.sort(key=lambda match: int(match["match_percentage"] or 0), reverse=True)
-
-    strong_matches = [match for match in matches if int(match["match_percentage"] or 0) >= 75]
-
-    return {
-        "job": scraped_job,
-        "matches": matches,
-        "total_resumes": len(candidates),
-        "strong_matches": strong_matches,
-    }
+_job_match_locks: dict[int, threading.Lock] = {}
+_job_match_locks_guard = threading.Lock()

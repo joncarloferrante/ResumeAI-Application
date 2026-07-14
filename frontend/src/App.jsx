@@ -131,6 +131,19 @@ function formatValue(value) {
   return String(value);
 }
 
+function formatDetailValue(value, fallback) {
+  if (value === null || value === undefined || value === "") {
+    return fallback;
+  }
+
+  const text = String(value);
+  if (!text.trim() || missingValueTokens.has(text.trim().toLowerCase())) {
+    return fallback;
+  }
+
+  return text;
+}
+
 function formatYears(value) {
   if (value === null || value === undefined || value === "" || Number(value) <= 0) {
     return "Not found";
@@ -156,6 +169,26 @@ function formatLabel(value) {
     .replace(/[_-]+/g, " ")
     .trim()
     .replace(/\b\w/g, (letter) => letter.toUpperCase()) || "Not found";
+}
+
+const normalizeSource = (value) => String(value ?? "").trim().toLowerCase();
+
+function inferSourceFromUrl(url) {
+  const hostname = String(url || "")
+    .trim()
+    .toLowerCase()
+    .replace(/^https?:\/\//, "")
+    .split("/")[0];
+
+  if (hostname.includes("atlanticrecruiters.com")) {
+    return "Atlantic Group";
+  }
+
+  if (hostname.includes("blairandpotts.com")) {
+    return "Blair & Potts";
+  }
+
+  return "";
 }
 
 function formatPercent(value) {
@@ -603,6 +636,7 @@ function App() {
   const [jobBoardError, setJobBoardError] = useState("");
   const [jobFilters, setJobFilters] = useState({
     query: "",
+    source: "All Sources",
     department: "All Departments",
     location: "All Locations",
     status: "All Statuses",
@@ -613,6 +647,7 @@ function App() {
   const [jobMatches, setJobMatches] = useState([]);
   const [isLoadingJobMatches, setIsLoadingJobMatches] = useState(false);
   const [jobMatchTab, setJobMatchTab] = useState("top");
+  const [selectedMatch, setSelectedMatch] = useState(null);
   const [isJobDetailsModalOpen, setIsJobDetailsModalOpen] = useState(false);
   const [isJobModalOpen, setIsJobModalOpen] = useState(false);
   const [jobForm, setJobForm] = useState(emptyJobForm);
@@ -654,6 +689,8 @@ function App() {
   const [isDraggingUpload, setIsDraggingUpload] = useState(false);
   const uploadInputRef = useRef(null);
   const uploadProgressTimerRef = useRef(null);
+  const jobMatchRequestRef = useRef(0);
+  const activeJobIdRef = useRef(null);
 
   const isAdmin = user?.role === "admin";
   const navigationItems = useMemo(
@@ -848,6 +885,7 @@ function App() {
   const jobs = useMemo(() => jobBoard.jobs || [], [jobBoard.jobs]);
   const visibleJobs = useMemo(() => {
     const normalizedQuery = jobFilters.query.trim().toLowerCase();
+    const selectedSource = normalizeSource(jobFilters.source);
 
     return jobs.filter((job) => {
       const matchesQuery =
@@ -867,6 +905,9 @@ function App() {
             .toLowerCase()
             .includes(normalizedQuery),
         );
+      const matchesSource =
+        jobFilters.source === "All Sources" ||
+        normalizeSource(job.source) === selectedSource;
       const matchesDepartment =
         jobFilters.department === "All Departments" || job.department === jobFilters.department;
       const matchesLocation =
@@ -876,9 +917,25 @@ function App() {
       const matchesJobType =
         jobFilters.jobType === "All Types" || job.job_type === jobFilters.jobType;
 
-      return matchesQuery && matchesDepartment && matchesLocation && matchesStatus && matchesJobType;
+      return matchesQuery && matchesSource && matchesDepartment && matchesLocation && matchesStatus && matchesJobType;
     });
   }, [jobFilters, jobs]);
+
+  const jobSources = useMemo(
+    () =>
+      Array.from(
+        new Set(
+          jobs
+            .map((job) => job.source || job.company || inferSourceFromUrl(job.url) || "Unknown")
+            .filter(Boolean),
+        ),
+      ).sort((firstSource, secondSource) =>
+        String(firstSource).localeCompare(String(secondSource), undefined, {
+          sensitivity: "base",
+        }),
+      ),
+    [jobs],
+  );
 
   const jobDepartments = useMemo(
     () => Array.from(new Set(jobs.map((job) => job.department).filter(Boolean))).sort(),
@@ -900,11 +957,25 @@ function App() {
   }, [currentJobPage, visibleJobs]);
   const jobStart = visibleJobs.length === 0 ? 0 : (currentJobPage - 1) * jobsPerPage + 1;
   const jobEnd = Math.min(currentJobPage * jobsPerPage, visibleJobs.length);
-  const selectedJobMatches = [...jobMatches].sort(
-    (firstMatch, secondMatch) => Number(secondMatch.match_percentage || 0) - Number(firstMatch.match_percentage || 0),
+  const jobBoardSummary = useMemo(
+    () => ({
+      total_jobs: jobs.length,
+      open_jobs: jobs.filter((job) => {
+        const status = String(job.status || "").trim().toLowerCase();
+        return job.active === 1 || job.active === true || status === "open";
+      }).length,
+      active_candidates: 0,
+      strong_matches: 0,
+      offers_sent: 0,
+      average_time_to_fill: "N/A",
+    }),
+    [jobs],
   );
-  const strongJobMatches = selectedJobMatches.filter((match) => Number(match.match_percentage || 0) >= 75);
-  const otherJobMatches = selectedJobMatches.filter((match) => Number(match.match_percentage || 0) < 75);
+  const selectedJobMatches = [...jobMatches].sort(
+    (firstMatch, secondMatch) => Number(secondMatch.match_score || secondMatch.match_percentage || 0) - Number(firstMatch.match_score || firstMatch.match_percentage || 0),
+  );
+  const strongJobMatches = selectedJobMatches.filter((match) => Number(match.match_score || match.match_percentage || 0) >= 75);
+  const otherJobMatches = selectedJobMatches.filter((match) => Number(match.match_score || match.match_percentage || 0) < 75);
   const selectedJobDescriptionSections = splitJobDescription(
     selectedJob?.full_description || selectedJob?.description || selectedJob?.job_description || "",
   );
@@ -982,6 +1053,10 @@ function App() {
     setSelectedCandidate(null);
   };
 
+  const closeMatchDetails = () => {
+    setSelectedMatch(null);
+  };
+
   const updateAuditFilter = (key, value) => {
     setAuditFilters((currentFilters) => ({
       ...currentFilters,
@@ -1056,6 +1131,8 @@ function App() {
       const response = await api.get("/api/scraped-jobs");
       const nextJobs = (response.data?.jobs || []).map((job) => ({
         ...job,
+        source: job.source || job.company || inferSourceFromUrl(job.url) || "Unknown",
+        company: job.company || job.source || inferSourceFromUrl(job.url) || "Unknown",
         job_id: job.job_number,
         department: job.department || job.employment_type || "",
         job_type: job.employment_type || "",
@@ -1064,7 +1141,7 @@ function App() {
       }));
       setJobBoard({
         jobs: nextJobs,
-        summary: emptyJobBoard.summary,
+        summary: response.data?.summary || emptyJobBoard.summary,
       });
       setSelectedJob(null);
       return true;
@@ -1082,17 +1159,36 @@ function App() {
     }
   }, []);
 
-  const loadJobMatches = useCallback(async (job) => {
+  const loadJobMatches = useCallback(async (job, refresh = false) => {
     if (!job) {
       setJobMatches([]);
       return false;
     }
 
+    const requestId = ++jobMatchRequestRef.current;
+    activeJobIdRef.current = job.id;
     setIsLoadingJobMatches(true);
+    setJobMatches([]);
 
     try {
-      const response = await api.get(`/api/scraped-jobs/${job.id}/matches`);
-      setJobMatches(response.data.matches || []);
+      const response = await api.get(`/api/scraped-jobs/${job.id}/matches`, {
+        params: refresh ? { refresh: 1 } : undefined,
+      });
+      console.debug("frontend_received_score", {
+        job_id: response.data?.job_id,
+        candidate_count: response.data?.matches?.length || 0,
+        first_match_score: response.data?.matches?.[0]?.match_score,
+        first_match_percentage: response.data?.matches?.[0]?.match_percentage,
+      });
+      const responseJobId = Number(response.data?.job_id ?? response.data?.job?.id ?? response.data?.job?.job_id ?? 0);
+      const isCurrentRequest = requestId === jobMatchRequestRef.current && activeJobIdRef.current === job.id;
+      if (!isCurrentRequest || responseJobId !== Number(job.id)) {
+        return false;
+      }
+      setJobMatches((response.data.matches || []).map((match) => ({
+        ...match,
+        job_id: Number(match.job_id ?? responseJobId ?? job.id),
+      })));
       return true;
     } catch (error) {
       console.error(error);
@@ -1508,9 +1604,12 @@ function App() {
       ...currentFilters,
       [key]: value,
     }));
+    setCurrentJobPage(1);
   };
 
   const handleSelectJob = (job) => {
+    setJobMatches([]);
+    setSelectedMatch(null);
     setSelectedJob(job);
     setJobMatchTab("top");
   };
@@ -2643,7 +2742,7 @@ function App() {
   };
 
   const renderJobBoardPage = () => {
-    const summary = jobBoard.summary || emptyJobBoard.summary;
+    const summary = jobBoardSummary || emptyJobBoard.summary;
     const jobCards = [
       { label: "Total Jobs", value: formatMetric(summary.total_jobs) },
       { label: "Open Jobs", value: formatMetric(summary.open_jobs) },
@@ -2696,6 +2795,16 @@ function App() {
                   placeholder="Search title, keyword, or job ID..."
                 />
               </div>
+            </label>
+
+            <label className="audit-filter">
+              <span>Source</span>
+              <select value={jobFilters.source} onChange={(event) => updateJobFilter("source", event.target.value)}>
+                <option>All Sources</option>
+                {jobSources.map((source) => (
+                  <option key={source}>{source}</option>
+                ))}
+              </select>
             </label>
 
             <label className="audit-filter">
@@ -2767,12 +2876,14 @@ function App() {
               <table className="data-table job-table">
                 <thead>
                   <tr>
-                    <th>Job Title</th>
-                    <th>Location</th>
-                    <th>Employment Type</th>
-                    <th>Job Number</th>
-                    <th>Salary</th>
-                    <th>Active</th>
+                <th>Job Title</th>
+                <th>Company</th>
+                <th>Source</th>
+                <th>Location</th>
+                <th>Employment Type</th>
+                <th>Job Number</th>
+                <th>Salary</th>
+                <th>Active</th>
                     <th>Last Scraped</th>
                     <th>Actions</th>
                   </tr>
@@ -2780,13 +2891,13 @@ function App() {
                 <tbody>
                   {jobs.length === 0 ? (
                     <tr>
-                      <td className="empty-state" colSpan="8">
+                      <td className="empty-state" colSpan="10">
                         {isLoadingJobs ? "Loading jobs..." : "No scraped jobs found yet."}
                       </td>
                     </tr>
                   ) : visibleJobs.length === 0 ? (
                     <tr>
-                      <td className="empty-state" colSpan="8">
+                      <td className="empty-state" colSpan="10">
                         No jobs match your filters.
                       </td>
                     </tr>
@@ -2802,6 +2913,8 @@ function App() {
                             <strong>{formatValue(job.title)}</strong>
                           </button>
                         </td>
+                        <td><TableValue value={job.company || "Unknown"} /></td>
+                        <td><TableValue value={job.source || "Unknown"} /></td>
                         <td><TableValue value={job.location} /></td>
                         <td><TableValue value={job.employment_type} /></td>
                         <td><TableValue value={job.job_number} /></td>
@@ -2946,6 +3059,9 @@ function App() {
                                     )}
                                   </div>
                                 </div>
+                                <button className="secondary-button" type="button" onClick={() => setSelectedMatch(match)}>
+                                  View Match
+                                </button>
                               </article>
                             );
                           })}
@@ -2998,6 +3114,9 @@ function App() {
                                 )}
                               </div>
                             </div>
+                            <button className="secondary-button" type="button" onClick={() => setSelectedMatch(match)}>
+                              View Match
+                            </button>
                           </article>
                         );
                       })}
@@ -3049,6 +3168,9 @@ function App() {
                                     )}
                                   </div>
                                 </div>
+                                <button className="secondary-button" type="button" onClick={() => setSelectedMatch(match)}>
+                                  View Match
+                                </button>
                               </article>
                             );
                           })}
@@ -3068,7 +3190,7 @@ function App() {
   };
 
   const renderJobMatchCard = (match) => {
-    const score = Number(match.match_percentage) || 0;
+    const score = Number(match.match_score || match.match_percentage) || 0;
     const matchClass = score >= 90 ? "is-strong" : score >= 75 ? "is-warning" : "is-danger";
 
     return (
@@ -3085,6 +3207,16 @@ function App() {
 
         <div className="match-card-meta">
           <span>{formatYears(match.years_experience)} years of experience</span>
+          <span>{formatValue(match.match_source || match.source)}</span>
+          <span>{match.is_cached ? "Cached" : "New"}</span>
+        </div>
+
+        <div className="match-skill-group">
+          <span>Match Level</span>
+          <div className="skill-tag-list">
+            <span className="skill-tag">{formatValue(match.match_level)}</span>
+            <span className="skill-tag">{formatValue(match.recommended_action)}</span>
+          </div>
         </div>
 
         <div className="match-skill-group">
@@ -3113,11 +3245,29 @@ function App() {
           </div>
         </div>
 
+        <div className="match-skill-group">
+          <span>Recruiter Summary</span>
+          <p className="job-description">{formatValue(match.recruiter_summary)}</p>
+        </div>
+
         <button className="secondary-button" type="button" onClick={() => handleViewCandidate({ id: match.candidate_id })}>
           View Candidate
         </button>
+
+        <button className="secondary-button" type="button" onClick={() => setSelectedMatch(match)}>
+          View Match
+        </button>
       </article>
     );
+  };
+
+  const getRequirementFallback = (match, key, fallbackText) => {
+    const status = match?.extraction_status?.job?.[key];
+    if (status === "not specified") {
+      return fallbackText;
+    }
+
+    return fallbackText;
   };
 
   const renderSecurityDashboardPage = () => {
@@ -3413,7 +3563,21 @@ function App() {
 
             <div className="job-details-grid job-details-grid--matches">
               <section className="detail-card">
-                <h3>Candidate Matches</h3>
+                <div className="job-detail-header">
+                  <div>
+                    <span>Candidate Matches</span>
+                    <h3>Best matching resumes</h3>
+                    <p>Sorted from highest percentage to lowest.</p>
+                  </div>
+                  <button
+                    className="secondary-button"
+                    type="button"
+                    onClick={() => loadJobMatches(selectedJob, true)}
+                    disabled={isLoadingJobMatches}
+                  >
+                    {isLoadingJobMatches ? "Refreshing..." : "Recalculate Matches"}
+                  </button>
+                </div>
 
                 {isLoadingJobMatches ? (
                   <p className="empty-state">Loading candidate matches...</p>
@@ -3447,6 +3611,165 @@ function App() {
                   </>
                 )}
               </section>
+            </div>
+          </section>
+        </div>
+      )}
+
+      {selectedMatch && (
+        <div className="modal-overlay" onClick={closeMatchDetails}>
+          <section
+            className="details-modal job-details-modal"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="match-details-title"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <header className="modal-header">
+              <div>
+                <h2 id="match-details-title">Match Details</h2>
+                <p>{formatValue(selectedMatch.candidate_name)}</p>
+              </div>
+
+              <button className="modal-close" type="button" onClick={closeMatchDetails}>
+                Close
+              </button>
+            </header>
+
+            <div className="details-grid">
+              <section className="detail-card">
+                <h3>Overview</h3>
+                <dl>
+                  <DetailItem label="Overall Match Score" value={formatPercent(selectedMatch.match_score ?? selectedMatch.match_percentage ?? 0)} />
+                  <DetailItem label="Match Level" value={selectedMatch.match_level} />
+                  <DetailItem label="Match Source" value={selectedMatch.match_source || selectedMatch.source} />
+                  <DetailItem label="Recommended Action" value={selectedMatch.recommended_action} />
+                </dl>
+              </section>
+
+              <section className="detail-card">
+                <h3>Match Breakdown</h3>
+                <dl>
+                  <DetailItem
+                    label="Required Skills"
+                    value={(selectedMatch.required_skills || []).length
+                      ? selectedMatch.required_skills.join(", ")
+                      : formatDetailValue(
+                          selectedMatch.extraction_status?.job?.required_skills,
+                          "No required skills were specified in the job posting."
+                        )}
+                  />
+                  <DetailItem
+                    label="Matched Skills"
+                    value={(selectedMatch.matched_skills || []).length ? selectedMatch.matched_skills.join(", ") : "No overlapping skills were found."}
+                  />
+                  <DetailItem
+                    label="Missing Required Skills"
+                    value={(selectedMatch.missing_skills || []).length
+                      ? selectedMatch.missing_skills.join(", ")
+                      : formatDetailValue(
+                          selectedMatch.extraction_status?.job?.required_skills,
+                          "No required skills were specified in the job posting."
+                        )}
+                  />
+                  <DetailItem
+                    label="Preferred Skills"
+                    value={(selectedMatch.preferred_skills || []).length
+                      ? selectedMatch.preferred_skills.join(", ")
+                      : "No preferred skills were specified."}
+                  />
+                  <DetailItem
+                    label="Matched Preferred Skills"
+                    value={(selectedMatch.matched_preferred_skills || []).length ? selectedMatch.matched_preferred_skills.join(", ") : "No preferred skills matched."}
+                  />
+                  <DetailItem
+                    label="Job Title Fit"
+                    value={
+                      selectedMatch.job_title_fit
+                        ? `${formatValue(selectedMatch.job_title_fit.candidate_title)} against ${formatValue(selectedMatch.job_title_fit.job_title)}`
+                        : "Not found"
+                    }
+                  />
+                  <DetailItem
+                    label="Years of Experience"
+                    value={
+                      selectedMatch.years_of_experience
+                        ? `Required: ${selectedMatch.years_of_experience.required_years ?? "not specified"}, Candidate: ${selectedMatch.years_of_experience.candidate_years ?? "not found"}`
+                        : "Years of experience requirement not specified in the job posting."
+                    }
+                  />
+                  <DetailItem
+                    label="Industry Match"
+                    value={
+                      selectedMatch.industry_match
+                        ? selectedMatch.industry_match.industry_match
+                          ? "Matched"
+                          : "No direct match"
+                        : "Not found"
+                    }
+                  />
+                  <DetailItem
+                    label="Certifications"
+                    value={
+                      selectedMatch.certification_match
+                        ? (selectedMatch.certification_match.matched_certifications || []).length
+                          ? selectedMatch.certification_match.matched_certifications.join(", ")
+                          : "No matching certifications were found."
+                        : "The job posting does not specify certifications."
+                    }
+                  />
+                  <DetailItem
+                    label="Education"
+                    value={
+                      selectedMatch.education_match
+                        ? selectedMatch.education_match.candidate_education || "The candidate's education was not extracted."
+                        : "The job posting does not specify an education requirement."
+                    }
+                  />
+                  <DetailItem
+                    label="Location Match"
+                    value={
+                      selectedMatch.location_match
+                        ? selectedMatch.location_match.candidate_location_match
+                          ? "Aligned with job location"
+                          : "No location alignment"
+                        : "The job posting does not specify a location requirement."
+                    }
+                  />
+                </dl>
+              </section>
+
+              <section className="detail-card">
+                <h3>Recruiter Notes</h3>
+                <dl>
+                  <DetailItem label="Recruiter Summary" value={selectedMatch.recruiter_summary} />
+                </dl>
+              </section>
+
+              {selectedMatch.match_source === "Qwen Final Review" ? (
+                <section className="detail-card">
+                  <h3>Qwen Final Review</h3>
+                  <dl>
+                    <DetailItem
+                      label="Strengths"
+                      value={(selectedMatch.qwen_final_review?.strengths || selectedMatch.strengths || []).length ? (selectedMatch.qwen_final_review?.strengths || selectedMatch.strengths).join(", ") : "No strengths were returned by Qwen."}
+                    />
+                    <DetailItem
+                      label="Gaps"
+                      value={(selectedMatch.qwen_final_review?.gaps || selectedMatch.gaps || []).length ? (selectedMatch.qwen_final_review?.gaps || selectedMatch.gaps).join(", ") : "No gaps were returned by Qwen."}
+                    />
+                    <DetailItem
+                      label="Recommendation"
+                      value={selectedMatch.qwen_final_review?.recommendation || selectedMatch.recommended_action}
+                    />
+                  </dl>
+                </section>
+              ) : (
+                <section className="detail-card">
+                  <h3>Qwen Final Review</h3>
+                  <p className="empty-state">This candidate was ranked using the Python matching engine.</p>
+                </section>
+              )}
             </div>
           </section>
         </div>
