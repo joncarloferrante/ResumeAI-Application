@@ -18,3 +18,5 @@ uploads/
 
 # Environment variables
 .env
+backend/.env
+frontend/.env
