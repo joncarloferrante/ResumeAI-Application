@@ -68,7 +68,121 @@ def is_section_heading(text: str) -> bool:
         "QUALIFICATIONS",
         "OFFER DETAILS",
         "BENEFITS",
+        "JOB OVERVIEW",
+        "OVERVIEW",
+        "ABOUT THE ROLE",
+        "THE ROLE",
+        "POSITION OVERVIEW",
+        "ABOUT THIS POSITION",
+        "WHO WE ARE",
+        "ABOUT US",
+        "KEY RESPONSIBILITIES",
+        "WHAT YOU'LL DO",
+        "WHAT YOU WILL DO",
+        "YOUR IMPACT",
+        "IN THIS ROLE",
+        "WHAT YOU'LL BE DOING",
+        "DUTIES",
+        "JOB RESPONSIBILITIES",
+        "YOUR RESPONSIBILITIES",
+        "REQUIREMENTS",
+        "WHAT WE'RE LOOKING FOR",
+        "WE'D LOVE TO HEAR FROM YOU IF",
+        "SKILLS AND EXPERIENCE",
+        "REQUIRED QUALIFICATIONS",
+        "PREFERRED QUALIFICATIONS",
+        "WHO YOU ARE",
+        "WHAT YOU BRING",
+        "BENEFITS AND PERKS",
+        "BENEFITS & PERKS",
+        "WHAT WE OFFER",
+        "WHAT WE PROVIDE",
+        "PERKS",
+        "COMPENSATION AND BENEFITS",
+        "TOTAL REWARDS",
+        "ADDITIONAL INFORMATION",
+        "ADDITIONAL NOTES",
+        "EEO STATEMENT",
+        "EQUAL OPPORTUNITY",
+        "WORK AUTHORIZATION",
+        "VISA SPONSORSHIP",
+        "APPLICATION INFORMATION",
+        "SCHEDULE",
+        "COMPENSATION",
+        "SALARY",
     }
+
+
+def _strip_heading_suffix(value: str) -> str:
+    normalized = cleaned_text(value).rstrip(":")
+    normalized = re.sub(r"\s*\(.*?\)\s*$", "", normalized).strip()
+    return normalized.lower()
+
+
+def classify_section_heading(text: str) -> str | None:
+    """Map common posting headings to the structured section buckets."""
+    normalized = _strip_heading_suffix(text)
+    heading_map = {
+        "overview": {
+            "job overview",
+            "overview",
+            "about the role",
+            "the role",
+            "position overview",
+            "about this position",
+            "who we are",
+            "about us",
+        },
+        "responsibilities": {
+            "responsibilities",
+            "key responsibilities",
+            "what you'll do",
+            "what you will do",
+            "your impact",
+            "in this role",
+            "what you'll be doing",
+            "duties",
+            "job responsibilities",
+            "your responsibilities",
+        },
+        "qualifications": {
+            "qualifications",
+            "requirements",
+            "what we're looking for",
+            "we'd love to hear from you if",
+            "skills and experience",
+            "required qualifications",
+            "preferred qualifications",
+            "who you are",
+            "what you bring",
+        },
+        "benefits": {
+            "benefits",
+            "benefits and perks",
+            "benefits & perks",
+            "what we offer",
+            "what we provide",
+            "perks",
+            "compensation and benefits",
+            "total rewards",
+            "offer details",
+        },
+        "additional_notes": {
+            "additional information",
+            "additional notes",
+            "eeo statement",
+            "equal opportunity",
+            "work authorization",
+            "visa sponsorship",
+            "application information",
+        },
+        "schedule": {"schedule"},
+        "compensation": {"compensation", "salary"},
+    }
+    for section_name, aliases in heading_map.items():
+        if normalized in aliases:
+            return section_name
+    return None
 
 
 def is_likely_job_title(text: str) -> bool:
@@ -146,25 +260,24 @@ def split_jobs_from_texts(texts: list[str]) -> list[tuple[str, list[str]]]:
 
 
 def gather_section_lines(lines: list[str]) -> dict[str, list[str]]:
-    """Split a job block into responsibilities, qualifications, benefits, and general description."""
+    """Split a job block into normalized section buckets."""
     sections = {
         "description": [],
+        "overview": [],
         "responsibilities": [],
         "qualifications": [],
         "benefits": [],
+        "additional_notes": [],
+        "schedule": [],
+        "compensation": [],
     }
     current_bucket = "description"
 
     for line in lines:
-        lowered = line.lower().rstrip(":")
-        if lowered == "responsibilities":
-            current_bucket = "responsibilities"
-            continue
-        if lowered == "qualifications":
-            current_bucket = "qualifications"
-            continue
-        if lowered in {"offer details", "benefits"}:
-            current_bucket = "benefits"
+        lowered = cleaned_text(line).lower().rstrip(":")
+        bucket = classify_section_heading(line)
+        if bucket:
+            current_bucket = bucket
             continue
         if lowered.startswith("please send cover letter") or lowered.startswith("please send resume"):
             current_bucket = "description"
@@ -258,9 +371,14 @@ def ensure_scraped_jobs_table() -> None:
             "qualifications",
             "benefits",
             "apply_email_or_link",
+            "manual_edited",
+            "manual_edited_at",
+            "manual_edited_by",
+            "additional_notes",
         ]:
             if column_name not in columns:
-                cursor.execute(f"ALTER TABLE scraped_jobs ADD COLUMN {column_name} TEXT")
+                column_definition = "INTEGER NOT NULL DEFAULT 0" if column_name == "manual_edited" else "TEXT"
+                cursor.execute(f"ALTER TABLE scraped_jobs ADD COLUMN {column_name} {column_definition}")
 
         cursor.execute("PRAGMA index_list(scraped_jobs)")
         indexes = cursor.fetchall()
@@ -297,11 +415,14 @@ def ensure_scraped_jobs_table() -> None:
                     company TEXT,
                     responsibilities TEXT,
                     qualifications TEXT,
-                    benefits TEXT,
-                    apply_email_or_link TEXT,
-                    job_key TEXT
-                )
-            """)
+                        benefits TEXT,
+                        apply_email_or_link TEXT,
+                        job_key TEXT,
+                        manual_edited INTEGER NOT NULL DEFAULT 0,
+                        manual_edited_at TIMESTAMP,
+                        manual_edited_by TEXT
+                    )
+                """)
             insert_columns = [row[1] for row in info]
             if "source" not in insert_columns:
                 insert_columns.extend(["source", "company", "responsibilities", "qualifications", "benefits", "apply_email_or_link", "job_key"])
@@ -336,7 +457,25 @@ def extract_job_details(title: str, lines: list[str], section_element) -> dict:
     responsibilities = bullet_list(sections["responsibilities"])
     qualifications = bullet_list(sections["qualifications"])
     benefits = bullet_list(sections["benefits"])
-    full_description = cleaned_text(" ".join(lines))
+    overview = bullet_list(sections["overview"])
+    additional_notes = bullet_list(sections["additional_notes"] + sections["schedule"] + sections["compensation"])
+
+    ordered_parts: list[str] = []
+    if overview:
+        ordered_parts.extend(overview)
+    for heading, values in [
+        ("Responsibilities", responsibilities),
+        ("Qualifications", qualifications),
+        ("Benefits", benefits),
+        ("Additional Notes", additional_notes),
+    ]:
+        if values:
+            ordered_parts.append(heading + ":")
+            ordered_parts.extend(values)
+
+    full_description = "\n\n".join(ordered_parts)
+    if not full_description:
+        full_description = cleaned_text(" ".join(lines))
     if not full_description:
         full_description = cleaned_text(" ".join(sections["description"]))
 
@@ -474,7 +613,7 @@ def save_blair_potts_jobs(jobs: list[dict]) -> tuple[int, int, int, int]:
 
             if existing:
                 changed = any(str(existing[key] or "") != str(value or "") for key, value in stored_row.items())
-                if changed:
+                if changed and not int(existing["manual_edited"] or 0):
                     cursor.execute("""
                         UPDATE scraped_jobs
                         SET source = ?,
@@ -517,6 +656,16 @@ def save_blair_potts_jobs(jobs: list[dict]) -> tuple[int, int, int, int]:
                     ))
                     updated += 1
                 else:
+                    cursor.execute("""
+                        UPDATE scraped_jobs
+                        SET active = ?,
+                            last_scraped = ?
+                        WHERE job_key = ?
+                    """, (
+                        stored_row["active"],
+                        stored_row["last_scraped"],
+                        job_key,
+                    ))
                     unchanged += 1
             else:
                 cursor.execute("""
@@ -537,9 +686,13 @@ def save_blair_potts_jobs(jobs: list[dict]) -> tuple[int, int, int, int]:
                         last_scraped,
                         department,
                         job_number,
-                        job_key
+                        job_key,
+                        manual_edited,
+                        manual_edited_at,
+                        manual_edited_by,
+                        additional_notes
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, NULL, NULL, NULL)
                 """, (
                     stored_row["source"],
                     stored_row["company"],

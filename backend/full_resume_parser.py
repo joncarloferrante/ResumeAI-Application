@@ -67,7 +67,7 @@ except ImportError:
 
 DEFAULT_MODEL = "qwen2.5-coder-3b-instruct"
 DEFAULT_BASE_URL = "http://localhost:1234/v1"
-from logging_config import get_logger
+from .logging_config import get_logger
 
 parser_logger = get_logger("parser")
 

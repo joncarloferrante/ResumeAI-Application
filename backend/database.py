@@ -21,8 +21,22 @@ DEFAULT_QWEN_MODEL = "qwen2.5-coder-3b-instruct"
 DEFAULT_QWEN_BASE_URL = "http://localhost:1234/v1"
 MATCH_CACHE_VERSION = "2026-07-14a"
 _MATCH_DEBUG_PRINTED = False
+SCRAPED_JOB_EDITABLE_COLUMNS = [
+    "title",
+    "location",
+    "department",
+    "employment_type",
+    "job_number",
+    "salary",
+    "description",
+    "responsibilities",
+    "qualifications",
+    "benefits",
+    "additional_notes",
+    "active",
+]
 
-from logging_config import get_logger
+from .logging_config import get_logger
 
 db_logger = get_logger("database")
 matcher_logger = get_logger("matcher")
@@ -58,6 +72,19 @@ def get_connection():
     conn = sqlite3.connect(DB_PATH)
     db_logger.info("SQLite connected")
     return conn
+
+
+def ensure_scraped_job_edit_columns(conn: sqlite3.Connection) -> None:
+    cursor = conn.cursor()
+    cursor.execute("PRAGMA table_info(scraped_jobs)")
+    columns = {row[1] for row in cursor.fetchall()}
+    for column_name, column_definition in {
+        "manual_edited": "INTEGER NOT NULL DEFAULT 0",
+        "manual_edited_at": "TIMESTAMP",
+        "manual_edited_by": "TEXT",
+    }.items():
+        if column_name not in columns:
+            cursor.execute(f"ALTER TABLE scraped_jobs ADD COLUMN {column_name} {column_definition}")
 
 
 def init_db():
@@ -1934,6 +1961,92 @@ def get_scraped_jobs():
         75,
     )
     return {"jobs": jobs, "summary": summary}
+
+
+def get_scraped_job_by_id(job_identifier: int | str):
+    conn = get_connection()
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+
+    ensure_scraped_job_edit_columns(conn)
+    cursor.execute(
+        """
+        SELECT *
+        FROM scraped_jobs
+        WHERE id = ? OR CAST(job_number AS TEXT) = ? OR title = ?
+        ORDER BY id DESC
+        LIMIT 1
+        """,
+        (job_identifier, str(job_identifier), str(job_identifier)),
+    )
+    row = cursor.fetchone()
+    conn.close()
+
+    return dict(row) if row else None
+
+
+def update_scraped_job(job_id: int, updates: dict, user_email: str | None) -> dict | None:
+    conn = get_connection()
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+
+    ensure_scraped_job_edit_columns(conn)
+    cursor.execute("SELECT * FROM scraped_jobs WHERE id = ?", (job_id,))
+    existing = cursor.fetchone()
+    if not existing:
+        conn.close()
+        return None
+
+    editable_values = {column: updates.get(column, existing[column]) for column in SCRAPED_JOB_EDITABLE_COLUMNS}
+    editable_values["manual_edited"] = 1
+    editable_values["manual_edited_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+    editable_values["manual_edited_by"] = user_email
+
+    cursor.execute(
+        """
+        UPDATE scraped_jobs
+        SET title = ?,
+            location = ?,
+            department = ?,
+            employment_type = ?,
+            job_number = ?,
+            salary = ?,
+            description = ?,
+            responsibilities = ?,
+            qualifications = ?,
+            benefits = ?,
+            additional_notes = ?,
+            active = ?,
+            manual_edited = ?,
+            manual_edited_at = ?,
+            manual_edited_by = ?,
+            last_scraped = last_scraped
+        WHERE id = ?
+        """,
+        (
+            editable_values["title"],
+            editable_values["location"],
+            editable_values["department"],
+            editable_values["employment_type"],
+            editable_values["job_number"],
+            editable_values["salary"],
+            editable_values["description"],
+            editable_values["responsibilities"],
+            editable_values["qualifications"],
+            editable_values["benefits"],
+            editable_values["additional_notes"],
+            int(bool(editable_values["active"])),
+            editable_values["manual_edited"],
+            editable_values["manual_edited_at"],
+            editable_values["manual_edited_by"],
+            job_id,
+        ),
+    )
+    conn.commit()
+    cursor.execute("SELECT * FROM scraped_jobs WHERE id = ?", (job_id,))
+    updated = cursor.fetchone()
+    conn.close()
+    return dict(updated) if updated else None
 
 
 def get_jobs():

@@ -2,9 +2,9 @@ import getpass
 import logging
 import sqlite3
 
-from auth_utils import hash_password
-from database import create_user, get_user_by_email, init_db, update_user_role
-from logging_config import get_logger
+from .auth_utils import hash_password
+from .database import create_user, get_user_by_email, init_db, update_user_role
+from .logging_config import get_logger
 
 VALID_ROLES = {"admin", "recruiter"}
 admin_logger = get_logger("admin")

@@ -1,7 +1,7 @@
 from datetime import datetime
 from pathlib import Path
 
-from full_resume_parser import parse_resume, create_lmstudio_client, DEFAULT_MODEL, DEFAULT_BASE_URL
+from .full_resume_parser import parse_resume, create_lmstudio_client, DEFAULT_MODEL, DEFAULT_BASE_URL
 
 
 def parse_resume_file(path: Path) -> dict:

@@ -14,9 +14,9 @@ import threading
 from dotenv import load_dotenv
 load_dotenv()
 
-from auth_utils import hash_password, verify_password
-from resume_parser import parse_resume_file
-from database import (
+from .auth_utils import hash_password, verify_password
+from .resume_parser import parse_resume_file
+from .database import (
     create_audit_log,
     apply_qwen_final_review,
     create_user,
@@ -30,6 +30,7 @@ from database import (
     get_candidate_by_id,
     get_dashboard_analytics,
     get_connection,
+    get_scraped_job_by_id,
     get_user_by_email,
     get_user_by_id,
     get_scraped_jobs,
@@ -39,13 +40,15 @@ from database import (
     reset_user_password,
     save_candidate,
     set_user_lock_status,
+    ensure_scraped_job_edit_columns,
+    update_scraped_job,
     update_user,
     get_candidates,
     count_users_by_role,
 )
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from logging_config import configure_logging, get_logger
+from .logging_config import configure_logging, get_logger
 
 configure_logging()
 logger = get_logger("main")
@@ -119,6 +122,21 @@ class UserUpdatePayload(BaseModel):
 
 class PasswordResetPayload(BaseModel):
     password: str
+
+
+class ScrapedJobUpdatePayload(BaseModel):
+    title: str | None = None
+    location: str | None = None
+    department: str | None = None
+    employment_type: str | None = None
+    job_number: str | None = None
+    salary: str | None = None
+    description: str | None = None
+    responsibilities: str | None = None
+    qualifications: str | None = None
+    benefits: str | None = None
+    additional_notes: str | None = None
+    active: bool | None = None
 
 
 def normalize_email(email: str) -> str:
@@ -738,6 +756,78 @@ def list_audit_logs(current_user: dict = Depends(get_current_user)):
 @app.get("/api/scraped-jobs")
 def list_scraped_jobs():
     return get_scraped_jobs()
+
+
+@app.patch("/api/scraped-jobs/{job_id}")
+def update_scraped_job_details(job_id: int, payload: ScrapedJobUpdatePayload, current_user: dict = Depends(get_current_user)):
+    allowed_roles = {"admin", "recruiter"}
+    if current_user.get("role") not in allowed_roles:
+        create_audit_log(
+            current_user["email"],
+            "Job Updated",
+            f"Denied update for job_id={job_id}",
+            "denied",
+        )
+        raise HTTPException(status_code=403, detail="Not authorized to edit jobs.")
+
+    existing_job = get_scraped_job_by_id(job_id)
+    if not existing_job:
+        create_audit_log(
+            current_user["email"],
+            "Job Updated",
+            f"Job not found for job_id={job_id}",
+            "failed",
+        )
+        raise HTTPException(status_code=404, detail="Scraped job not found")
+
+    update_data = {}
+    changed_fields = []
+    for field in [
+        "title",
+        "location",
+        "department",
+        "employment_type",
+        "job_number",
+        "salary",
+        "description",
+        "responsibilities",
+        "qualifications",
+        "benefits",
+        "additional_notes",
+        "active",
+    ]:
+        value = getattr(payload, field)
+        if value is None:
+            continue
+        update_data[field] = value.strip() if isinstance(value, str) else value
+        changed_fields.append(field)
+
+    if "title" in update_data and not str(update_data["title"]).strip():
+        raise HTTPException(status_code=400, detail="Title cannot be empty.")
+    if "job_number" in update_data and not str(update_data["job_number"]).strip() and existing_job.get("job_number"):
+        raise HTTPException(status_code=400, detail="Job number cannot be cleared once it exists.")
+
+    normalized_update_data = {
+        **{key: existing_job.get(key) for key in update_data.keys()},
+        **update_data,
+    }
+    updated_job = update_scraped_job(job_id, normalized_update_data, current_user.get("email"))
+    if not updated_job:
+        create_audit_log(
+            current_user["email"],
+            "Job Updated",
+            f"Update failed for job_id={job_id}",
+            "failed",
+        )
+        raise HTTPException(status_code=404, detail="Scraped job not found")
+
+    create_audit_log(
+        current_user["email"],
+        "Job Updated",
+        f"job_id={job_id}; fields={', '.join(changed_fields) if changed_fields else 'none'}",
+        "success",
+    )
+    return updated_job
 
 
 @app.get("/api/scraped-jobs/{job_id}/matches")

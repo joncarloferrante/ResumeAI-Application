@@ -8,7 +8,7 @@ from urllib.parse import urljoin, urlparse
 
 from bs4 import BeautifulSoup
 from playwright.sync_api import sync_playwright
-from logging_config import get_logger
+from ..logging_config import get_logger
 
 START_URL = "https://atlanticrecruiters.com/job-postings/"
 BASE_URL = "https://atlanticrecruiters.com"
@@ -76,9 +76,22 @@ def ensure_scraped_jobs_table() -> None:
                 salary TEXT,
                 description TEXT,
                 active INTEGER NOT NULL DEFAULT 1,
-                last_scraped TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                last_scraped TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                manual_edited INTEGER NOT NULL DEFAULT 0,
+                manual_edited_at TIMESTAMP,
+                manual_edited_by TEXT
             )
         """)
+        cursor = conn.cursor()
+        cursor.execute("PRAGMA table_info(scraped_jobs)")
+        columns = {row[1] for row in cursor.fetchall()}
+        for column_name, column_definition in {
+            "manual_edited": "INTEGER NOT NULL DEFAULT 0",
+            "manual_edited_at": "TIMESTAMP",
+            "manual_edited_by": "TEXT",
+        }.items():
+            if column_name not in columns:
+                cursor.execute(f"ALTER TABLE scraped_jobs ADD COLUMN {column_name} {column_definition}")
 
 
 def find_listing_links(soup: BeautifulSoup) -> list[str]:
@@ -229,7 +242,7 @@ def save_scraped_job(job: dict[str, str]) -> str:
                     description = ?,
                     active = 1,
                     last_scraped = CURRENT_TIMESTAMP
-                WHERE url = ?
+                WHERE url = ? AND COALESCE(manual_edited, 0) = 0
             """, (
                 job["title"],
                 job["location"],
@@ -240,7 +253,15 @@ def save_scraped_job(job: dict[str, str]) -> str:
                 job["description"],
                 job["url"],
             ))
-            scraper_logger.info("Existing jobs updated | url=%s", job["url"])
+            if cursor.rowcount == 0:
+                cursor.execute("""
+                    UPDATE scraped_jobs
+                    SET active = 1,
+                        last_scraped = CURRENT_TIMESTAMP
+                    WHERE url = ?
+                """, (job["url"],))
+            else:
+                scraper_logger.info("Existing jobs updated | url=%s", job["url"])
             return "updated"
 
         cursor.execute("""
@@ -254,9 +275,12 @@ def save_scraped_job(job: dict[str, str]) -> str:
                 salary,
                 description,
                 active,
-                last_scraped
+                last_scraped,
+                manual_edited,
+                manual_edited_at,
+                manual_edited_by
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, CURRENT_TIMESTAMP)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, CURRENT_TIMESTAMP, 0, NULL, NULL)
         """, (
             job["title"],
             job["url"],

@@ -308,6 +308,8 @@ function splitJobDescription(description) {
       overview: [],
       responsibilities: [],
       qualifications: [],
+      benefits: [],
+      additionalNotes: [],
       applicationNotice: [],
     };
   }
@@ -316,6 +318,8 @@ function splitJobDescription(description) {
     { key: "overview", label: "Job Overview" },
     { key: "responsibilities", label: "Responsibilities" },
     { key: "qualifications", label: "Qualifications" },
+    { key: "benefits", label: "Benefits" },
+    { key: "additionalNotes", label: "Additional Notes" },
     { key: "applicationNotice", label: "Application Notice" },
   ];
 
@@ -329,6 +333,8 @@ function splitJobDescription(description) {
     { key: "overview", pattern: /job overview\s*[-:–—]?\s*/gi },
     { key: "responsibilities", pattern: /responsibilities(?:\s+as)?\s*(?:the|a|an)?[^:\n]*:\s*/gi },
     { key: "qualifications", pattern: /qualifications(?:\s+for)?\s*(?:the|a|an)?[^:\n]*:\s*/gi },
+    { key: "benefits", pattern: /benefits(?:\s+and\s+perks)?\s*:\s*/gi },
+    { key: "additionalNotes", pattern: /(?:additional notes|notes|other information)\s*:\s*/gi },
     { key: "applicationNotice", pattern: /application notice\s*:\s*/gi },
   ];
 
@@ -352,6 +358,8 @@ function splitJobDescription(description) {
       overview: [cleanedDescription],
       responsibilities: [],
       qualifications: [],
+      benefits: [],
+      additionalNotes: [],
       applicationNotice: [],
     };
   }
@@ -366,6 +374,184 @@ function splitJobDescription(description) {
   });
 
   return sectionMap;
+}
+
+function normalizeSectionValues(value) {
+  if (value === null || value === undefined) {
+    return [];
+  }
+
+  if (Array.isArray(value)) {
+    return value.flatMap((entry) => normalizeSectionValues(entry));
+  }
+
+  if (typeof value === "string") {
+    const text = value.trim();
+    if (!text) {
+      return [];
+    }
+
+    try {
+      const parsed = JSON.parse(text);
+      if (Array.isArray(parsed)) {
+        return parsed.flatMap((entry) => normalizeSectionValues(entry));
+      }
+      if (parsed && typeof parsed === "object") {
+        return normalizeSectionValues(Object.values(parsed));
+      }
+      if (typeof parsed === "string") {
+        return normalizeSectionValues(parsed);
+      }
+    } catch {
+      // Fall through to plain-text handling.
+    }
+
+    const commaSeparated = text
+      .split(/\n|,|;\s*/)
+      .map((entry) => cleanJobText(entry))
+      .filter(Boolean);
+    return commaSeparated.length > 1 ? commaSeparated : [text];
+  }
+
+  if (typeof value === "object") {
+    return Object.values(value).flatMap((entry) => normalizeSectionValues(entry));
+  }
+
+  return [String(value).trim()].filter(Boolean);
+}
+
+function formatSectionParagraphs(value) {
+  return normalizeSectionValues(value)
+    .map((entry) => cleanJobText(entry))
+    .filter(Boolean);
+}
+
+function buildOverviewParagraphs(job) {
+  const jobText = cleanJobText(job?.description || job?.full_description || job?.job_description || "");
+  if (!jobText) {
+    return [];
+  }
+
+  const titleText = cleanJobText(job?.title || "");
+  const sectionBoundaryPattern = /\b(?:Responsibilities|Qualifications|Benefits|Additional Notes|What You’ll Do|What You'll Do|What You’ll Bring|What You'll Bring|What We Offer|What We Provide|Compensation|Salary)\b/i;
+  const titleIndex = titleText ? jobText.toLowerCase().indexOf(titleText.toLowerCase()) : -1;
+
+  let overviewSource = "";
+  if (titleIndex >= 0) {
+    overviewSource = jobText.slice(titleIndex + titleText.length);
+  } else {
+    overviewSource = jobText;
+  }
+
+  const boundaryMatch = overviewSource.match(sectionBoundaryPattern);
+  if (boundaryMatch && typeof boundaryMatch.index === "number") {
+    overviewSource = overviewSource.slice(0, boundaryMatch.index);
+  }
+
+  const marketingFilters = [
+    /about clay/i,
+    /our mission/i,
+    /we see growth as a creative practice/i,
+    /investor/i,
+    /funding/i,
+    /community/i,
+    /culture/i,
+    /glassdoor/i,
+    /forbes/i,
+    /new york times|nyt/i,
+    /customers/i,
+    /slack/i,
+    /club members/i,
+    /employee tender offer/i,
+    /valuation/i,
+    /operating principles/i,
+  ];
+
+  const paragraphs = toTextParagraphs(overviewSource)
+    .map((paragraph) => paragraph.trim())
+    .filter((paragraph) => paragraph && !marketingFilters.some((pattern) => pattern.test(paragraph)))
+    .filter((paragraph, index, array) => array.findIndex((value) => value.toLowerCase() === paragraph.toLowerCase()) === index);
+
+  return paragraphs;
+}
+
+function getStructuredJobSections(job) {
+  const responsibilities = formatSectionParagraphs(job?.responsibilities);
+  const qualifications = formatSectionParagraphs(job?.qualifications);
+  const benefits = formatSectionParagraphs(job?.benefits);
+  const additionalNotes = formatSectionParagraphs(job?.additional_notes);
+  const experience = extractExperienceRequirements(job, { responsibilities, qualifications, benefits, additionalNotes });
+
+  const fallbackSections = splitJobDescription(job?.description || job?.full_description || job?.job_description || "");
+
+  return {
+    overview: buildOverviewParagraphs(job),
+    responsibilities: responsibilities.length > 0 ? responsibilities : fallbackSections.responsibilities,
+    qualifications: qualifications.length > 0 ? qualifications : fallbackSections.qualifications,
+    experienceRequired: experience.items,
+    experienceYears: experience.years,
+    benefits: benefits.length > 0 ? benefits : fallbackSections.benefits,
+    additionalNotes: additionalNotes.length > 0 ? additionalNotes : fallbackSections.additionalNotes,
+  };
+}
+
+function extractExperienceRequirements(job, sections = {}) {
+  const sources = [
+    ...(sections.qualifications || []),
+    ...(sections.responsibilities || []),
+    ...(sections.additionalNotes || []),
+    cleanJobText(job?.description || job?.full_description || job?.job_description || ""),
+  ].filter(Boolean);
+
+  const experienceItems = [];
+  let experienceYears = "";
+  const yearPattern = /\b(\d+(?:\.\d+)?)\s*\+?\s*years?(?:\s+of)?\s+experience\b/i;
+  const experienceSignals = [
+    /\bexperience\b/i,
+    /\bmanaged\b/i,
+    /\bmanaging\b/i,
+    /\bpublic accounting\b/i,
+    /\bb2b\b/i,
+    /\bsaas\b/i,
+    /\bsql\b/i,
+    /\basc\s*740\b/i,
+    /\bteams?\b/i,
+    /\blead(?:ing|ership)\b/i,
+    /\bbackground\b/i,
+    /\bworked with\b/i,
+    /\bworking with\b/i,
+  ];
+
+  for (const source of sources) {
+    const text = cleanJobText(source);
+    if (!text) {
+      continue;
+    }
+
+    const segments = text
+      .split(/\n|[••]\s*|\.\s+(?=[A-Z0-9])/)
+      .map((segment) => cleanJobText(segment))
+      .filter(Boolean);
+
+    for (const segment of segments) {
+      const lower = segment.toLowerCase();
+      const hasExperienceSignal = experienceSignals.some((pattern) => pattern.test(segment));
+      if (!hasExperienceSignal) {
+        continue;
+      }
+
+      if (!experienceItems.some((item) => item.toLowerCase() === lower)) {
+        experienceItems.push(segment);
+      }
+
+      const yearMatch = segment.match(yearPattern);
+      if (yearMatch && !experienceYears) {
+        experienceYears = `${yearMatch[1]}+ Years`;
+      }
+    }
+  }
+
+  return { items: experienceItems, years: experienceYears };
 }
 
 function toTextParagraphs(value) {
@@ -401,6 +587,127 @@ function AppIcon({ children, className = "" }) {
     >
       {children}
     </svg>
+  );
+}
+
+function SpinnerIcon({ className = "" }) {
+  return (
+    <svg className={`app-icon spinner-icon ${className}`.trim()} viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+      <circle className="spinner-track" cx="12" cy="12" r="8.5" />
+      <path className="spinner-segment" d="M20.5 12a8.5 8.5 0 0 0-8.5-8.5" />
+    </svg>
+  );
+}
+
+function JobTitleIcon() {
+  return (
+    <AppIcon>
+      <path d="M7 5.5h10" />
+      <path d="M7 9.5h10" />
+      <path d="M7 13.5h7" />
+      <path d="M5.5 4.5h.01" />
+      <path d="M5.5 8.5h.01" />
+      <path d="M5.5 12.5h.01" />
+    </AppIcon>
+  );
+}
+
+function LocationIcon() {
+  return (
+    <AppIcon>
+      <path d="M12 20s5-4.4 5-9a5 5 0 1 0-10 0c0 4.6 5 9 5 9Z" />
+      <path d="M12 11.5a1.5 1.5 0 1 0 0-3 1.5 1.5 0 0 0 0 3Z" />
+    </AppIcon>
+  );
+}
+
+function BriefcaseIcon() {
+  return (
+    <AppIcon>
+      <path d="M9 7V6a1.5 1.5 0 0 1 1.5-1.5h3A1.5 1.5 0 0 1 15 6v1" />
+      <path d="M4.5 8.5h15v8a1 1 0 0 1-1 1h-13a1 1 0 0 1-1-1v-8Z" />
+      <path d="M4.5 11.5h15" />
+    </AppIcon>
+  );
+}
+
+function CurrencyIcon() {
+  return (
+    <AppIcon>
+      <path d="M12 4.5v15" />
+      <path d="M15.5 7.2a3.2 3.2 0 0 0-2.4-1.2h-2.6a2.75 2.75 0 1 0 0 5.5h2.6a2.75 2.75 0 1 1 0 5.5h-3.3a3.2 3.2 0 0 1-2.4-1.2" />
+    </AppIcon>
+  );
+}
+
+function CalendarIcon() {
+  return (
+    <AppIcon>
+      <path d="M7 4.5v2" />
+      <path d="M17 4.5v2" />
+      <path d="M4.5 8h15" />
+      <path d="M6 6.5h12A1.5 1.5 0 0 1 19.5 8v10A1.5 1.5 0 0 1 18 19.5H6A1.5 1.5 0 0 1 4.5 18V8A1.5 1.5 0 0 1 6 6.5Z" />
+    </AppIcon>
+  );
+}
+
+function DepartmentIcon() {
+  return (
+    <AppIcon>
+      <path d="M4.5 19.5h15" />
+      <path d="M7 19.5V9.5h10v10" />
+      <path d="M9 19.5v-4h2v4" />
+      <path d="M12.5 4.5h-5v5h5z" />
+    </AppIcon>
+  );
+}
+
+function HashIcon() {
+  return (
+    <AppIcon>
+      <path d="M9 4.5 7.5 19.5" />
+      <path d="M16.5 4.5 15 19.5" />
+      <path d="M5.5 9h13" />
+      <path d="M4.5 15h13" />
+    </AppIcon>
+  );
+}
+
+function PeopleIcon() {
+  return (
+    <AppIcon>
+      <path d="M9.5 11a3 3 0 1 0-3-3 3 3 0 0 0 3 3Z" />
+      <path d="M3.5 19.5a6 6 0 0 1 12 0" />
+      <path d="M16.5 12.5a2.7 2.7 0 0 0 2.5-2.7 2.8 2.8 0 0 0-2.2-2.7" />
+    </AppIcon>
+  );
+}
+
+function SparkIcon() {
+  return (
+    <AppIcon>
+      <path d="m12 4.5 1.3 4.2 4.2 1.3-4.2 1.3L12 15.5l-1.3-4.2-4.2-1.3 4.2-1.3L12 4.5Z" />
+    </AppIcon>
+  );
+}
+
+function EditIcon() {
+  return (
+    <AppIcon>
+      <path d="m5.5 15 8.9-8.9a1.4 1.4 0 0 1 2 0l1.5 1.5a1.4 1.4 0 0 1 0 2L9 18.1 5 19l.5-4Z" />
+      <path d="M14.5 6.5 17.5 9.5" />
+    </AppIcon>
+  );
+}
+
+function ScrapeIcon() {
+  return (
+    <AppIcon>
+      <path d="M7 5.5h10v13H7z" />
+      <path d="M9.5 5.5V4a1 1 0 0 1 1-1h3a1 1 0 0 1 1 1v1.5" />
+      <path d="M9.5 10h5" />
+      <path d="M9.5 13h5" />
+    </AppIcon>
   );
 }
 
@@ -646,6 +953,14 @@ function App() {
   const [selectedJob, setSelectedJob] = useState(null);
   const [jobMatches, setJobMatches] = useState([]);
   const [isLoadingJobMatches, setIsLoadingJobMatches] = useState(false);
+  const [jobMatchMessage, setJobMatchMessage] = useState("");
+  const [jobMatchStatus, setJobMatchStatus] = useState("idle");
+  const [jobMatchSummary, setJobMatchSummary] = useState({
+    analyzedCount: null,
+    highestScore: null,
+  });
+  const [jobMatchErrorMessage, setJobMatchErrorMessage] = useState("");
+  const [jobMatchStageIndex, setJobMatchStageIndex] = useState(0);
   const [jobMatchTab, setJobMatchTab] = useState("top");
   const [selectedMatch, setSelectedMatch] = useState(null);
   const [isJobDetailsModalOpen, setIsJobDetailsModalOpen] = useState(false);
@@ -653,6 +968,20 @@ function App() {
   const [jobForm, setJobForm] = useState(emptyJobForm);
   const [isSavingJob, setIsSavingJob] = useState(false);
   const [jobActionMessage, setJobActionMessage] = useState("");
+  const [isEditingJob, setIsEditingJob] = useState(false);
+  const [isSavingEditedJob, setIsSavingEditedJob] = useState(false);
+  const [jobEditMessage, setJobEditMessage] = useState("");
+  const [jobEditError, setJobEditError] = useState("");
+  const [jobEditForm, setJobEditForm] = useState({
+    title: "",
+    location: "",
+    department: "",
+    employment_type: "",
+    salary: "",
+    job_number: "",
+    description: "",
+    active: true,
+  });
   const [users, setUsers] = useState([]);
   const [isLoadingUsers, setIsLoadingUsers] = useState(false);
   const [usersError, setUsersError] = useState("");
@@ -691,6 +1020,7 @@ function App() {
   const uploadProgressTimerRef = useRef(null);
   const jobMatchRequestRef = useRef(0);
   const activeJobIdRef = useRef(null);
+  const jobMatchInProgressRef = useRef(false);
 
   const isAdmin = user?.role === "admin";
   const navigationItems = useMemo(
@@ -709,7 +1039,7 @@ function App() {
       window.clearInterval(uploadProgressTimerRef.current);
       uploadProgressTimerRef.current = null;
     }
-  }, []);
+  }, [isEditingJob, isSavingEditedJob]);
 
   const beginUploadProgressSimulation = useCallback(() => {
     stopUploadProgressSimulation();
@@ -971,14 +1301,144 @@ function App() {
     }),
     [jobs],
   );
-  const selectedJobMatches = [...jobMatches].sort(
-    (firstMatch, secondMatch) => Number(secondMatch.match_score || secondMatch.match_percentage || 0) - Number(firstMatch.match_score || firstMatch.match_percentage || 0),
+  const selectedJobMatches = useMemo(
+    () =>
+      [...jobMatches]
+        .filter((match) => Number(match.job_id ?? selectedJob?.id ?? 0) === Number(selectedJob?.id ?? 0))
+        .sort(
+          (firstMatch, secondMatch) =>
+            Number(secondMatch.match_score || secondMatch.match_percentage || 0) -
+            Number(firstMatch.match_score || firstMatch.match_percentage || 0),
+        ),
+    [jobMatches, selectedJob?.id],
   );
   const strongJobMatches = selectedJobMatches.filter((match) => Number(match.match_score || match.match_percentage || 0) >= 75);
   const otherJobMatches = selectedJobMatches.filter((match) => Number(match.match_score || match.match_percentage || 0) < 75);
-  const selectedJobDescriptionSections = splitJobDescription(
-    selectedJob?.full_description || selectedJob?.description || selectedJob?.job_description || "",
+  const selectedJobDescriptionSections = getStructuredJobSections(selectedJob);
+  const currentJobMatchLabel = formatValue(selectedJob?.title);
+  const jobMatchBestScore =
+    selectedJobMatches.length > 0
+      ? Math.max(...selectedJobMatches.map((match) => Number(match.match_score || match.match_percentage || 0)))
+      : null;
+  const jobMatchLastMatched = useMemo(() => {
+    const timestamps = selectedJobMatches
+      .map((match) => match.cache_updated_at || match.cache_created_at || match.updated_at || match.created_at)
+      .filter(Boolean)
+      .sort((first, second) => String(second).localeCompare(String(first)));
+
+    return timestamps[0] || null;
+  }, [selectedJobMatches]);
+  const isJobMatching = isLoadingJobMatches;
+  const isJobMatchComplete = jobMatchStatus === "success";
+  const isJobMatchFailed = jobMatchStatus === "error";
+  const matchStageItems = [
+    { label: "Preparing job details" },
+    { label: "Reading candidate profiles" },
+    { label: "Comparing skills and experience" },
+    { label: "Ranking candidates" },
+    { label: "Saving results" },
+  ].map((item, index) => {
+    let state = "upcoming";
+    if (isJobMatching) {
+      if (index < 1) {
+        state = "complete";
+      } else if (index === jobMatchStageIndex) {
+        state = "active";
+      } else if (index < jobMatchStageIndex) {
+        state = "complete";
+      }
+    } else if (isJobMatchComplete) {
+      state = "complete";
+    } else if (isJobMatchFailed) {
+      state = index === 0 ? "complete" : "upcoming";
+    }
+
+    return { ...item, state };
+  });
+
+  const buildJobEditForm = useCallback(
+    (job) => ({
+      title: String(job?.title || "").trim(),
+      location: String(job?.location || "").trim(),
+      department: String(job?.department || "").trim(),
+      employment_type: String(job?.employment_type || job?.job_type || "").trim(),
+      salary: String(job?.salary || "").trim(),
+      job_number: String(job?.job_number || job?.job_id || "").trim(),
+      description: String(job?.description || job?.full_description || job?.job_description || "").trim(),
+      active: job?.active === 1 || job?.active === true || String(job?.status || "").toLowerCase() === "open",
+    }),
+    [],
   );
+
+  const startJobEdit = () => {
+    if (!selectedJob || isJobMatching) {
+      return;
+    }
+    setIsEditingJob(true);
+    setJobEditError("");
+    setJobEditMessage("");
+    setJobEditForm(buildJobEditForm(selectedJob));
+  };
+
+  const cancelJobEdit = () => {
+    setIsEditingJob(false);
+    setIsSavingEditedJob(false);
+    setJobEditError("");
+    setJobEditMessage("");
+    setJobEditForm(buildJobEditForm(selectedJob));
+  };
+
+  const handleSaveJobEdit = async (event) => {
+    event.preventDefault();
+    if (!selectedJob || isSavingEditedJob || isJobMatching) {
+      return;
+    }
+
+    const trimmedTitle = String(jobEditForm.title || "").trim();
+    const trimmedJobNumber = String(jobEditForm.job_number || "").trim();
+    if (!trimmedTitle) {
+      setJobEditError("Title is required.");
+      return;
+    }
+    if (!trimmedJobNumber && String(selectedJob.job_number || selectedJob.job_id || "").trim()) {
+      setJobEditError("Job number cannot be cleared once it exists.");
+      return;
+    }
+
+    setIsSavingEditedJob(true);
+    setJobEditError("");
+    setJobEditMessage("");
+
+    const payload = {
+      title: trimmedTitle,
+      location: String(jobEditForm.location || "").trim(),
+      department: String(jobEditForm.department || "").trim(),
+      employment_type: String(jobEditForm.employment_type || "").trim(),
+      salary: String(jobEditForm.salary || "").trim(),
+      job_number: trimmedJobNumber,
+      description: String(jobEditForm.description || "").trim(),
+      active: Boolean(jobEditForm.active),
+    };
+
+    try {
+      const response = await api.patch(`/api/scraped-jobs/${selectedJob.id}`, payload);
+      const updatedJob = response.data;
+      setSelectedJob(updatedJob);
+      setJobBoard((currentJobBoard) => ({
+        ...currentJobBoard,
+        jobs: currentJobBoard.jobs.map((job) => (job.id === updatedJob.id ? { ...job, ...updatedJob } : job)),
+      }));
+      setJobEditForm(buildJobEditForm(updatedJob));
+      setJobEditMessage("Job updated successfully.");
+      setIsEditingJob(false);
+    } catch (error) {
+      console.error(error);
+      const detail = error.response?.data?.detail;
+      setJobEditError(detail || "Could not update the job.");
+    } finally {
+      setIsSavingEditedJob(false);
+    }
+  };
 
   const handleUserRoleChange = async (targetUser, nextRole) => {
     if (!targetUser || targetUser.role === nextRole) {
@@ -1161,14 +1621,28 @@ function App() {
 
   const loadJobMatches = useCallback(async (job, refresh = false) => {
     if (!job) {
-      setJobMatches([]);
       return false;
     }
 
+    if (jobMatchInProgressRef.current || isEditingJob || isSavingEditedJob) {
+      setJobBoardError("");
+      setJobMatchMessage(
+        jobMatchInProgressRef.current
+          ? "Candidate matching is already in progress. Please wait for it to finish."
+          : "Finish editing this job before starting a new match.",
+      );
+      return false;
+    }
+
+    jobMatchInProgressRef.current = true;
     const requestId = ++jobMatchRequestRef.current;
     activeJobIdRef.current = job.id;
+    setJobMatchStatus("loading");
+    setJobMatchErrorMessage("");
+    setJobMatchSummary({ analyzedCount: null, highestScore: null });
+    setJobMatchStageIndex(2);
+    setJobMatchMessage("Matching candidates...");
     setIsLoadingJobMatches(true);
-    setJobMatches([]);
 
     try {
       const response = await api.get(`/api/scraped-jobs/${job.id}/matches`, {
@@ -1185,22 +1659,35 @@ function App() {
       if (!isCurrentRequest || responseJobId !== Number(job.id)) {
         return false;
       }
-      setJobMatches((response.data.matches || []).map((match) => ({
+      const nextMatches = (response.data.matches || []).map((match) => ({
         ...match,
         job_id: Number(match.job_id ?? responseJobId ?? job.id),
-      })));
+      }));
+      setJobMatches(nextMatches);
+      setJobMatchSummary({
+        analyzedCount: response.data?.candidate_count ?? response.data?.matches?.length ?? nextMatches.length,
+        highestScore:
+          nextMatches.length > 0
+            ? Math.max(...nextMatches.map((match) => Number(match.match_score || match.match_percentage || 0)))
+            : null,
+      });
+      setJobMatchStageIndex(5);
+      setJobMatchStatus("success");
       return true;
     } catch (error) {
       console.error(error);
       if (error.response?.status === 401) {
         setUser(null);
       } else {
-        setJobBoardError("Could not load candidate matches.");
+        const detail = error.response?.data?.detail;
+        setJobMatchErrorMessage(detail || "Matching could not be completed.");
+        setJobMatchStatus("error");
       }
-      setJobMatches([]);
       return false;
     } finally {
+      jobMatchInProgressRef.current = false;
       setIsLoadingJobMatches(false);
+      setJobMatchMessage("");
     }
   }, []);
 
@@ -1337,12 +1824,6 @@ function App() {
   }, [loadJobs, safeActivePage, user]);
 
   useEffect(() => {
-    if (safeActivePage === "jobBoard" && selectedJob && user) {
-      loadJobMatches(selectedJob);
-    }
-  }, [loadJobMatches, safeActivePage, selectedJob, user]);
-
-  useEffect(() => {
     if (safeActivePage === "users" && user) {
       loadUsers();
     }
@@ -1380,6 +1861,12 @@ function App() {
   useEffect(() => {
     setCurrentJobPage(1);
   }, [jobFilters, jobs]);
+
+  useEffect(() => {
+    if (selectedJob) {
+      setJobEditForm(buildJobEditForm(selectedJob));
+    }
+  }, [buildJobEditForm, selectedJob]);
 
   useEffect(() => {
     if (currentJobPage > totalJobPages) {
@@ -1608,19 +2095,41 @@ function App() {
   };
 
   const handleSelectJob = (job) => {
-    setJobMatches([]);
+    if (jobMatchInProgressRef.current || isEditingJob || isSavingEditedJob) {
+      setJobBoardError("");
+      setJobMatchMessage(
+        jobMatchInProgressRef.current
+          ? "Candidate matching is already in progress. Please wait for it to finish."
+          : "Finish editing this job before starting a new match.",
+      );
+      return;
+    }
     setSelectedMatch(null);
     setSelectedJob(job);
     setJobMatchTab("top");
+    setJobMatchStatus("idle");
+    setJobMatchSummary({ analyzedCount: null, highestScore: null });
+    setJobMatchErrorMessage("");
+    setJobMatchStageIndex(0);
+    setJobMatchMessage("");
   };
 
   const openJobDetailsModal = (job) => {
+    if (jobMatchInProgressRef.current) {
+      setJobBoardError("");
+      setJobMatchMessage("Candidate matching is already in progress. Please wait for it to finish.");
+      return;
+    }
     handleSelectJob(job);
     setIsJobDetailsModalOpen(true);
   };
 
   const closeJobDetailsModal = () => {
     setIsJobDetailsModalOpen(false);
+    setIsEditingJob(false);
+    setJobEditError("");
+    setJobEditMessage("");
+    setJobMatchMessage("");
   };
 
   const closeJobModal = () => {
@@ -2775,6 +3284,14 @@ function App() {
         </header>
 
         {jobBoardError && <p className="error-message">{jobBoardError}</p>}
+        {isJobMatching && selectedJob && (
+          <div className="job-match-banner" role="status" aria-live="polite">
+            <SpinnerIcon />
+            <span>
+              Matching candidates for {formatValue(selectedJob.title)}. Other matching actions are temporarily disabled.
+            </span>
+          </div>
+        )}
 
         <div className="metric-grid job-metric-grid">
           {jobCards.map((card) => (
@@ -2905,11 +3422,26 @@ function App() {
                     paginatedJobs.map((job) => (
                       <tr
                         key={job.id}
-                        className={selectedJob?.id === job.id ? "is-selected-row" : ""}
-                        onClick={() => handleSelectJob(job)}
+                        className={[
+                          selectedJob?.id === job.id ? "is-selected-row" : "",
+                          isJobMatching && selectedJob?.id !== job.id ? "is-job-row-disabled" : "",
+                        ]
+                          .filter(Boolean)
+                          .join(" ")}
+                        onClick={() => {
+                          if (isJobMatching && selectedJob?.id !== job.id) {
+                            return;
+                          }
+                          handleSelectJob(job);
+                        }}
                       >
                         <td>
-                          <button className="job-title-button" type="button" onClick={() => handleSelectJob(job)}>
+                          <button
+                            className="job-title-button"
+                            type="button"
+                            onClick={() => handleSelectJob(job)}
+                            disabled={isJobMatching && selectedJob?.id !== job.id}
+                          >
                             <strong>{formatValue(job.title)}</strong>
                           </button>
                         </td>
@@ -2922,7 +3454,12 @@ function App() {
                         <td>{job.active ? "Yes" : "No"}</td>
                         <td><TableValue value={job.last_scraped} /></td>
                         <td>
-                          <button className="view-button" type="button" onClick={() => openJobDetailsModal(job)}>
+                          <button
+                            className="view-button"
+                            type="button"
+                            onClick={() => openJobDetailsModal(job)}
+                            disabled={isJobMatching && selectedJob?.id !== job.id}
+                          >
                             View
                           </button>
                         </td>
@@ -3261,6 +3798,164 @@ function App() {
     );
   };
 
+  const renderModalMatchCard = (match, index) => {
+    const score = Number(match.match_score || match.match_percentage || 0);
+    const matchLevel = formatValue(match.match_level);
+    const isTopMatch = index === 0;
+    const currentPosition = formatValue(match.current_position);
+    const matchSource = formatValue(match.match_source || match.source);
+    const recommendedAction = formatValue(match.recommended_action);
+    const matchedSkills = (match.matched_skills || []).filter(Boolean);
+    const missingSkills = (match.missing_skills || []).filter(Boolean);
+    const preferredSkills = (match.preferred_skills || []).filter(Boolean);
+
+    const detailItems = [
+      {
+        label: "Matched skills",
+        value: matchedSkills.length ? matchedSkills : [],
+        emptyText: "No matched skills identified",
+        tone: "positive",
+      },
+      {
+        label: "Missing skills",
+        value: missingSkills.length ? missingSkills : [],
+        emptyText: "No missing skills identified",
+        tone: "negative",
+      },
+      {
+        label: "Preferred skills",
+        value: preferredSkills.length ? preferredSkills : [],
+        emptyText: "No preferred skills identified",
+        tone: "neutral",
+      },
+    ];
+
+    return (
+      <article className={`match-result-card ${isTopMatch ? "is-top-match" : ""}`} key={`${match.candidate_id || match.candidate_name || index}`}>
+        <div className="match-result-card-header">
+          <div className="match-result-rank" aria-label={`Rank ${index + 1}`}>
+            #{index + 1}
+          </div>
+          <div className="match-result-title">
+            <div className="match-result-title-row">
+              <h4>{formatValue(match.candidate_name)}</h4>
+              {isTopMatch && <span className="match-result-top-badge">Top Match</span>}
+            </div>
+            <p>{currentPosition}</p>
+          </div>
+          <div className="match-result-score">
+            <strong>{formatPercent(score)}</strong>
+            <span>{matchLevel}</span>
+          </div>
+        </div>
+
+        <div className="match-result-meta">
+          <span className={`match-level-pill match-level-${String(match.match_level || "").toLowerCase().replace(/\s+/g, "-") || "neutral"}`}>
+            {matchLevel}
+          </span>
+          <span>{recommendedAction}</span>
+          {matchSource !== "Not found" && <span>{matchSource}</span>}
+        </div>
+
+        <details className="match-result-details">
+          <summary>View Match Details</summary>
+          <div className="match-result-details-body">
+            <div className="match-result-grid">
+              <div className="match-result-field">
+                <span>Experience alignment</span>
+                <strong>{formatValue(match.years_of_experience ? `Required: ${match.years_of_experience.required_years ?? "not specified"}, Candidate: ${match.years_of_experience.candidate_years ?? "not found"}` : "Not found")}</strong>
+              </div>
+              <div className="match-result-field">
+                <span>Title fit</span>
+                <strong>
+                  {match.job_title_fit
+                    ? `${formatValue(match.job_title_fit.candidate_title)} against ${formatValue(match.job_title_fit.job_title)}`
+                    : "Not found"}
+                </strong>
+              </div>
+              <div className="match-result-field">
+                <span>Industry match</span>
+                <strong>
+                  {match.industry_match
+                    ? match.industry_match.industry_match
+                      ? "Matched"
+                      : "No direct match"
+                    : "Not found"}
+                </strong>
+              </div>
+              <div className="match-result-field">
+                <span>Education</span>
+                <strong>
+                  {match.education_match
+                    ? match.education_match.candidate_education || "The candidate's education was not extracted."
+                    : "Not found"}
+                </strong>
+              </div>
+              <div className="match-result-field">
+                <span>Certifications</span>
+                <strong>
+                  {match.certification_match
+                    ? (match.certification_match.matched_certifications || []).length
+                      ? match.certification_match.matched_certifications.join(", ")
+                      : "No matching certifications were found."
+                    : "Not found"}
+                </strong>
+              </div>
+              <div className="match-result-field">
+                <span>Location match</span>
+                <strong>
+                  {match.location_match
+                    ? match.location_match.candidate_location_match
+                      ? "Aligned with job location"
+                      : "No location alignment"
+                    : "Not found"}
+                </strong>
+              </div>
+            </div>
+
+            <div className="match-result-skills">
+              {detailItems.map((item) => (
+                <div className="match-result-skill-group" key={item.label}>
+                  <span>{item.label}</span>
+                  <div className="skill-tag-list">
+                    {item.value.length ? (
+                      item.value.map((skill) => (
+                        <span
+                          className={`skill-tag ${item.tone === "positive" ? "is-positive" : item.tone === "negative" ? "is-missing" : "is-neutral"}`}
+                          key={skill}
+                        >
+                          {skill}
+                        </span>
+                      ))
+                    ) : (
+                      <span className="skill-tag is-muted">{item.emptyText}</span>
+                    )}
+                  </div>
+                </div>
+              ))}
+            </div>
+
+            <div className="match-result-summary">
+              <div>
+                <span>Recruiter summary</span>
+                <p>{formatValue(match.recruiter_summary)}</p>
+              </div>
+            </div>
+
+            <div className="match-result-actions">
+              <button className="secondary-button" type="button" onClick={() => handleViewCandidate({ id: match.candidate_id })}>
+                View Candidate
+              </button>
+              <button className="secondary-button" type="button" onClick={() => setSelectedMatch(match)}>
+                View Match Details
+              </button>
+            </div>
+          </div>
+        </details>
+      </article>
+    );
+  };
+
   const getRequirementFallback = (match, key, fallbackText) => {
     const status = match?.extraction_status?.job?.[key];
     if (status === "not specified") {
@@ -3510,103 +4205,434 @@ function App() {
             aria-labelledby="job-details-title"
             onClick={(event) => event.stopPropagation()}
           >
-            <header className="modal-header">
-              <div>
-                <h2 id="job-details-title">Job Details</h2>
-                <p>{formatValue(selectedJob.title)}</p>
+            <header className="job-details-header">
+              <div className="job-details-heading">
+                <div className="job-details-title-row">
+                  <h2 id="job-details-title">{formatValue(selectedJob.title)}</h2>
+                </div>
+
+                <div className="job-details-badges" aria-label="Job status details">
+                  <span className="job-detail-badge job-detail-badge--success">Active</span>
+                  <span className="job-detail-badge job-detail-badge--neutral">
+                    {formatValue(selectedJob.employment_type || selectedJob.job_type)}
+                  </span>
+                  <span className="job-detail-badge job-detail-badge--neutral">
+                    Job #{formatValue(selectedJob.job_number || selectedJob.job_id)}
+                  </span>
+                </div>
               </div>
 
-              <button className="modal-close" type="button" onClick={closeJobDetailsModal}>
-                Close
-              </button>
+              <div className="job-details-header-actions">
+                <button className="modal-close job-details-close" type="button" onClick={closeJobDetailsModal}>
+                  <AppIcon>
+                    <path d="M6.5 6.5 17.5 17.5" />
+                    <path d="M17.5 6.5 6.5 17.5" />
+                  </AppIcon>
+                  <span>Close</span>
+                </button>
+                <button className="primary-button job-details-edit-button" type="button" onClick={startJobEdit} disabled={isJobMatching || isEditingJob || isSavingEditedJob}>
+                  <EditIcon />
+                  <span>Edit Job</span>
+                </button>
+              </div>
             </header>
 
-            <div className="job-details-grid">
-              <section className="detail-card">
-                <h3>Job Summary</h3>
-                <dl>
-                  <DetailItem label="Title" value={selectedJob.title} />
-                  <DetailItem label="Location" value={selectedJob.location} />
-                  <DetailItem label="Employment Type" value={selectedJob.employment_type || selectedJob.job_type} />
-                  <DetailItem label="Job Number" value={selectedJob.job_number || selectedJob.job_id} />
-                  <DetailItem label="Salary" value={formatSalary(selectedJob.salary)} />
-                  <DetailItem label="Active Status" value={selectedJob.active ? "Active" : "Inactive"} />
-                  <DetailItem label="Last Scraped" value={formatDate(selectedJob.last_scraped)} />
-                </dl>
-
-                {selectedJob.url && (
-                  <a className="primary-button" href={selectedJob.url} target="_blank" rel="noreferrer">
-                    Open Original Job
-                  </a>
-                )}
-              </section>
-
-              <section className="detail-card">
-                <h3>Job Description</h3>
-                <div className="job-section-stack">
-                  <JobDetailSection title="Job Overview" content={selectedJobDescriptionSections.overview} />
-                  <JobDetailSection
-                    title="Responsibilities"
-                    content={selectedJobDescriptionSections.responsibilities}
-                  />
-                  <JobDetailSection
-                    title="Qualifications"
-                    content={selectedJobDescriptionSections.qualifications}
-                  />
-                  <JobDetailSection
-                    title="Application Notice"
-                    content={selectedJobDescriptionSections.applicationNotice}
-                  />
-                </div>
-              </section>
-            </div>
-
-            <div className="job-details-grid job-details-grid--matches">
-              <section className="detail-card">
-                <div className="job-detail-header">
-                  <div>
-                    <span>Candidate Matches</span>
-                    <h3>Best matching resumes</h3>
-                    <p>Sorted from highest percentage to lowest.</p>
+            {(isJobMatching || isJobMatchComplete || isJobMatchFailed) && (
+              <section
+                className={`match-feedback-card ${isJobMatching ? "is-loading" : isJobMatchComplete ? "is-success" : "is-error"}`}
+                aria-live="polite"
+              >
+                <div className="match-feedback-header">
+                  <div className="match-feedback-icon" aria-hidden="true">
+                    {isJobMatching ? <SpinnerIcon /> : isJobMatchComplete ? <CheckIcon /> : <AppIcon><path d="M12 9v4" /><path d="M12 16.5h.01" /><path d="M4.5 19.5h15L12 4.5 4.5 19.5Z" /></AppIcon>}
                   </div>
-                  <button
-                    className="secondary-button"
-                    type="button"
-                    onClick={() => loadJobMatches(selectedJob, true)}
-                    disabled={isLoadingJobMatches}
-                  >
-                    {isLoadingJobMatches ? "Refreshing..." : "Recalculate Matches"}
-                  </button>
+                  <div>
+                    <h3>
+                      {isJobMatching
+                        ? "Finding the best candidates..."
+                        : isJobMatchComplete
+                          ? "Matching Complete"
+                          : "Matching could not be completed."}
+                    </h3>
+                    <p>
+                      {isJobMatching
+                        ? "Comparing this job with uploaded candidate profiles."
+                        : isJobMatchComplete
+                          ? "The latest match results are ready for review."
+                          : jobMatchErrorMessage || "The matching request did not finish successfully."}
+                    </p>
+                  </div>
                 </div>
 
-                {isLoadingJobMatches ? (
-                  <p className="empty-state">Loading candidate matches...</p>
-                ) : jobMatches.length === 0 ? (
-                  <p className="empty-state">No resumes have been uploaded.</p>
-                ) : strongJobMatches.length === 0 ? (
-                  <>
-                    <p className="empty-state">No strong matches found.</p>
-                    {otherJobMatches.length > 0 && (
-                      <details>
-                        <summary>Other Candidates</summary>
-                        <div className="match-card-list">
-                          {otherJobMatches.map(renderJobMatchCard)}
-                        </div>
-                      </details>
+                <div className="match-feedback-body">
+                  <div className="match-feedback-job">
+                    <span>Job being matched</span>
+                    <strong>{currentJobMatchLabel}</strong>
+                    <p>Other matching actions are temporarily disabled while this session is active.</p>
+                  </div>
+
+                  <ul className="match-stage-list">
+                    {matchStageItems.map((stage) => (
+                      <li key={stage.label} className={`match-stage-item is-${stage.state}`}>
+                        <span className="match-stage-marker" aria-hidden="true">
+                          {stage.state === "complete" ? <CheckIcon /> : stage.state === "active" ? <SpinnerIcon /> : <span />}
+                        </span>
+                        <span>{stage.label}</span>
+                      </li>
+                    ))}
+                  </ul>
+
+                  {isJobMatchComplete && (
+                    <div className="match-feedback-summary">
+                      <div>
+                        <span>Analyzed candidates</span>
+                        <strong>{jobMatchSummary.analyzedCount ?? jobMatches.length ?? 0}</strong>
+                      </div>
+                      <div>
+                        <span>Highest match</span>
+                        <strong>{formatPercent(jobMatchSummary.highestScore ?? jobMatchBestScore ?? 0)}</strong>
+                      </div>
+                      <button className="secondary-button" type="button" onClick={() => setJobMatchTab("top")}>
+                        View Matches
+                      </button>
+                    </div>
+                  )}
+
+                  {isJobMatchFailed && (
+                    <div className="match-feedback-actions">
+                      <button
+                        className="primary-button"
+                        type="button"
+                        onClick={() => loadJobMatches(selectedJob, true)}
+                        disabled={isJobMatching}
+                      >
+                        Try Again
+                      </button>
+                    </div>
+                  )}
+                </div>
+              </section>
+            )}
+
+            <div className="job-details-body">
+              <aside className="job-details-sidebar">
+                <section className="detail-card job-summary-card">
+                  <div className="detail-card-header">
+                    <div className="detail-card-kicker">
+                      <JobTitleIcon />
+                      <span>Job Summary</span>
+                    </div>
+                    <p>Quick facts at a glance.</p>
+                  </div>
+                  <dl className="job-summary-list">
+                    <DetailItem icon={JobTitleIcon} label="Job Title" value={selectedJob.title} />
+                    <DetailItem icon={UsersIcon} label="Company" value={selectedJob.company || "Not found"} />
+                    <DetailItem icon={LocationIcon} label="Location" value={selectedJob.location} />
+                    <DetailItem icon={DepartmentIcon} label="Department" value={selectedJob.department} />
+                    <DetailItem icon={BriefcaseIcon} label="Employment Type" value={selectedJob.employment_type || selectedJob.job_type} />
+                    <DetailItem icon={CurrencyIcon} label="Salary" value={formatSalary(selectedJob.salary)} />
+                    <DetailItem icon={CalendarIcon} label="Schedule" value={selectedJob.schedule || selectedJob.job_schedule || "Not found"} />
+                    {selectedJobDescriptionSections.experienceYears && (
+                      <DetailItem icon={SparkIcon} label="Experience Required" value={selectedJobDescriptionSections.experienceYears} />
                     )}
-                  </>
+                    <DetailItem icon={HashIcon} label="Job Number" value={selectedJob.job_number || selectedJob.job_id} />
+                    <DetailItem icon={ScrapeIcon} label="Last Updated" value={formatDate(selectedJob.last_scraped)} />
+                  </dl>
+                </section>
+
+                <section className="detail-card quick-actions-card">
+                  <div className="detail-card-header">
+                    <div className="detail-card-kicker">
+                      <SparkIcon />
+                      <span>Quick Actions</span>
+                    </div>
+                  </div>
+                  <div className="job-details-actions">
+                    <button
+                      className="primary-button job-details-action-button"
+                      type="button"
+                      onClick={() => loadJobMatches(selectedJob, true)}
+                      disabled={isLoadingJobMatches || isEditingJob || isSavingEditedJob}
+                    >
+                      {isLoadingJobMatches ? <SpinnerIcon /> : <AppIcon><path d="M11.5 5.5a6 6 0 1 0 6 6" /><path d="m16.5 4.5 1.5 1.5-1.5 1.5" /></AppIcon>}
+                      <span>{isLoadingJobMatches ? (jobMatches.length > 0 ? "Recalculating..." : "Matching Candidates...") : "Match Candidates"}</span>
+                    </button>
+                    <button className="secondary-button job-details-action-button" type="button" onClick={startJobEdit} disabled={isJobMatching || isEditingJob || isSavingEditedJob}>
+                      <AppIcon>
+                        <path d="m5.5 15 8.9-8.9a1.4 1.4 0 0 1 2 0l1.5 1.5a1.4 1.4 0 0 1 0 2L9 18.1 5 19l.5-4Z" />
+                      </AppIcon>
+                      <span>Edit Job</span>
+                    </button>
+                    <a
+                      className="secondary-button job-details-action-button job-details-link-button"
+                      href={selectedJob.url}
+                      target="_blank"
+                      rel="noreferrer"
+                    >
+                      <AppIcon>
+                        <path d="M14 5.5h4.5V10" />
+                        <path d="M9.5 14.5 18.5 5.5" />
+                        <path d="M13 5.5H6.5A2 2 0 0 0 4.5 7.5v10A2 2 0 0 0 6.5 19.5h10A2 2 0 0 0 18.5 17.5V11" />
+                      </AppIcon>
+                      <span>Open Original Job</span>
+                    </a>
+                  </div>
+                </section>
+
+                <section className="detail-card status-card">
+                  <div className="detail-card-header">
+                    <div className="detail-card-kicker">
+                      <SparkIcon />
+                      <span>Matching Status</span>
+                    </div>
+                  </div>
+                  <div className="status-panel">
+                    <div className="status-panel-copy">
+                      <strong>
+                        {isLoadingJobMatches
+                          ? "Matching in progress"
+                          : strongJobMatches.length > 0
+                            ? "Strong matches available"
+                            : "This job has not been matched yet"}
+                      </strong>
+                      <p>
+                        {isLoadingJobMatches
+                          ? "Please wait while candidate resumes are analyzed."
+                          : strongJobMatches.length > 0
+                            ? "Review the strongest candidate resumes below."
+                            : "Click Match Candidates to find the best matches."}
+                      </p>
+                    </div>
+                    <div className={`status-pill ${isLoadingJobMatches ? "status-warning" : strongJobMatches.length > 0 ? "status-success" : "status-neutral"}`}>
+                      {isLoadingJobMatches ? "Analyzing" : strongJobMatches.length > 0 ? "Ready" : "Pending"}
+                    </div>
+                  </div>
+                  {jobMatchMessage && <p className="status-message">{jobMatchMessage}</p>}
+                </section>
+              </aside>
+
+              <section className="job-details-content">
+                {isEditingJob ? (
+                  <form className="detail-card job-edit-form" onSubmit={handleSaveJobEdit}>
+                    <div className="detail-card-header">
+                      <div className="detail-card-kicker">
+                        <EditIcon />
+                        <span>Edit Job</span>
+                      </div>
+                      <p>Update supported job details and save the corrections.</p>
+                    </div>
+
+                    {jobEditError && <p className="error-message" aria-live="polite">{jobEditError}</p>}
+                    {jobEditMessage && <p className="success-message" aria-live="polite">{jobEditMessage}</p>}
+
+                    <div className="job-edit-grid">
+                      <label className="job-edit-field">
+                        <span>Title *</span>
+                        <input
+                          type="text"
+                          value={jobEditForm.title}
+                          onChange={(event) => setJobEditForm((current) => ({ ...current, title: event.target.value }))}
+                          required
+                        />
+                      </label>
+                      <label className="job-edit-field">
+                        <span>Job Number</span>
+                        <input
+                          type="text"
+                          value={jobEditForm.job_number}
+                          onChange={(event) => setJobEditForm((current) => ({ ...current, job_number: event.target.value }))}
+                        />
+                      </label>
+                      <label className="job-edit-field">
+                        <span>Location</span>
+                        <input
+                          type="text"
+                          value={jobEditForm.location}
+                          onChange={(event) => setJobEditForm((current) => ({ ...current, location: event.target.value }))}
+                        />
+                      </label>
+                      <label className="job-edit-field">
+                        <span>Department</span>
+                        <input
+                          type="text"
+                          value={jobEditForm.department}
+                          onChange={(event) => setJobEditForm((current) => ({ ...current, department: event.target.value }))}
+                        />
+                      </label>
+                      <label className="job-edit-field">
+                        <span>Employment Type</span>
+                        <input
+                          type="text"
+                          value={jobEditForm.employment_type}
+                          onChange={(event) => setJobEditForm((current) => ({ ...current, employment_type: event.target.value }))}
+                        />
+                      </label>
+                      <label className="job-edit-field">
+                        <span>Salary</span>
+                        <input
+                          type="text"
+                          value={jobEditForm.salary}
+                          onChange={(event) => setJobEditForm((current) => ({ ...current, salary: event.target.value }))}
+                        />
+                      </label>
+                    </div>
+
+                    <label className="job-edit-field job-edit-field--full">
+                      <span>Job Overview / Description</span>
+                      <textarea
+                        rows={8}
+                        value={jobEditForm.description}
+                        onChange={(event) => setJobEditForm((current) => ({ ...current, description: event.target.value }))}
+                      />
+                    </label>
+
+                    <label className="job-edit-check">
+                      <input
+                        type="checkbox"
+                        checked={jobEditForm.active}
+                        onChange={(event) => setJobEditForm((current) => ({ ...current, active: event.target.checked }))}
+                      />
+                      <span>Active status</span>
+                    </label>
+
+                    <div className="job-edit-actions">
+                      <button className="secondary-button" type="button" onClick={cancelJobEdit} disabled={isSavingEditedJob}>
+                        Cancel
+                      </button>
+                      <button className="primary-button" type="submit" disabled={isSavingEditedJob}>
+                        {isSavingEditedJob ? <SpinnerIcon /> : null}
+                        <span>{isSavingEditedJob ? "Saving..." : "Save Changes"}</span>
+                      </button>
+                    </div>
+                  </form>
                 ) : (
                   <>
-                    <div className="match-card-list">
-                      {strongJobMatches.map(renderJobMatchCard)}
-                    </div>
-                    {otherJobMatches.length > 0 && (
-                      <details>
-                        <summary>Other Candidates</summary>
-                        <div className="match-card-list">
-                          {otherJobMatches.map(renderJobMatchCard)}
+                    <section className="detail-card">
+                      <div className="detail-card-header">
+                        <div className="detail-card-kicker">
+                          <JobTitleIcon />
+                          <span>Job Overview</span>
                         </div>
-                      </details>
+                      </div>
+                      <div className="job-section-stack">
+                        <JobDetailSection title="Job Overview" content={selectedJobDescriptionSections.overview} />
+                      </div>
+                    </section>
+
+                    <section className="detail-card">
+                      <div className="detail-card-header">
+                        <div className="detail-card-kicker">
+                          <PeopleIcon />
+                          <span>Responsibilities</span>
+                        </div>
+                      </div>
+                      <div className="job-section-stack">
+                        <JobDetailSection
+                          title="Responsibilities"
+                          content={selectedJobDescriptionSections.responsibilities}
+                        />
+                      </div>
+                    </section>
+
+                    <section className="detail-card">
+                      <div className="detail-card-header">
+                        <div className="detail-card-kicker">
+                          <BriefcaseIcon />
+                          <span>Qualifications</span>
+                        </div>
+                      </div>
+                      <div className="job-section-stack">
+                        <JobDetailSection
+                          title="Qualifications"
+                          content={selectedJobDescriptionSections.qualifications}
+                        />
+                      </div>
+                    </section>
+
+                    {selectedJobDescriptionSections.experienceRequired?.length > 0 && (
+                      <section className="detail-card">
+                        <div className="detail-card-header">
+                          <div className="detail-card-kicker">
+                            <SparkIcon />
+                            <span>Experience Required</span>
+                          </div>
+                        </div>
+                        <div className="job-section-stack">
+                          <JobDetailSection
+                            title="Experience Required"
+                            content={selectedJobDescriptionSections.experienceRequired}
+                          />
+                        </div>
+                      </section>
+                    )}
+
+                    {selectedJobDescriptionSections.benefits?.length > 0 && (
+                      <section className="detail-card">
+                        <div className="detail-card-header">
+                          <div className="detail-card-kicker">
+                            <SparkIcon />
+                            <span>Benefits</span>
+                          </div>
+                        </div>
+                        <div className="job-section-stack">
+                          <JobDetailSection title="Benefits" content={selectedJobDescriptionSections.benefits} />
+                        </div>
+                      </section>
+                    )}
+
+                    {selectedJobDescriptionSections.additionalNotes?.length > 0 && (
+                      <section className="detail-card">
+                        <div className="detail-card-header">
+                          <div className="detail-card-kicker">
+                            <ScrapeIcon />
+                            <span>Additional Notes</span>
+                          </div>
+                        </div>
+                        <div className="job-section-stack">
+                          <JobDetailSection
+                            title="Additional Notes"
+                            content={selectedJobDescriptionSections.additionalNotes}
+                          />
+                        </div>
+                      </section>
+                    )}
+
+                    {(jobMatches.length > 0 || isJobMatchComplete || isJobMatchFailed) && (
+                      <section className="job-match-results-section" aria-labelledby="job-match-results-title">
+                        <div className="detail-card-header job-match-results-header">
+                          <div className="detail-card-kicker">
+                            <SparkIcon />
+                            <h3 id="job-match-results-title">Candidate Matches</h3>
+                          </div>
+                          <div className="job-match-results-summary">
+                            <span className={`job-match-results-badge ${jobMatches.length > 0 ? "is-active" : "is-muted"}`}>
+                              {jobMatches.length > 0
+                                ? "Results Available"
+                                : isJobMatchFailed || isJobMatchComplete
+                                  ? "No Matches Found"
+                                  : "Matching Complete"}
+                            </span>
+                            <span>Analyzed: {jobMatchSummary.analyzedCount ?? jobMatches.length ?? 0}</span>
+                            <span>Results shown: {jobMatches.length}</span>
+                            <span>Highest match: {formatPercent(jobMatchSummary.highestScore ?? jobMatchBestScore ?? 0)}</span>
+                            <span>Last matched: {jobMatchLastMatched ? formatDate(jobMatchLastMatched) : "Not found"}</span>
+                          </div>
+                        </div>
+
+                        {jobMatches.length === 0 ? (
+                          <div className="job-match-empty-state">
+                            <strong>No candidate matches found.</strong>
+                            <p>No uploaded candidates currently match this job.</p>
+                            <button className="secondary-button" type="button" onClick={() => loadJobMatches(selectedJob, true)} disabled={isJobMatching}>
+                              Recalculate Matches
+                            </button>
+                          </div>
+                        ) : (
+                          <div className="match-result-list">
+                            {selectedJobMatches.map((match, index) => renderModalMatchCard(match, index))}
+                          </div>
+                        )}
+                      </section>
                     )}
                   </>
                 )}
@@ -4119,10 +5145,15 @@ function App() {
   );
 }
 
-function DetailItem({ label, value }) {
+function DetailItem({ icon: Icon, label, value }) {
   return (
     <div className="detail-item">
-      <dt>{label}</dt>
+      <dt>
+        <span className="detail-item-icon" aria-hidden="true">
+          <Icon />
+        </span>
+        <span>{label}</span>
+      </dt>
       <dd>{formatValue(value)}</dd>
     </div>
   );
