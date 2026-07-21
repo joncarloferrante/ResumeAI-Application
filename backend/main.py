@@ -121,6 +121,23 @@ ENABLE_REGISTRATION = os.environ.get("ENABLE_REGISTRATION", "").lower() == "true
 DUPLICATE_RESUME_MESSAGE = "This resume was already uploaded."
 
 
+def _is_production_cookie_mode() -> bool:
+    """Use secure cross-site cookies when the configured origins are HTTPS."""
+    cookie_mode = os.environ.get("COOKIE_SECURE_MODE", "").strip().lower()
+    if cookie_mode in {"1", "true", "yes", "on"}:
+        return True
+    if cookie_mode in {"0", "false", "no", "off"}:
+        return False
+
+    configured_origins = []
+    for env_name in ("FRONTEND_ORIGIN", "CORS_ALLOWED_ORIGINS"):
+        value = os.environ.get(env_name, "")
+        if value.strip():
+            configured_origins.extend(origin.strip() for origin in value.split(",") if origin.strip())
+
+    return any(origin.startswith("https://") for origin in configured_origins)
+
+
 class AuthCredentials(BaseModel):
     email: str
     password: str
@@ -240,24 +257,28 @@ def set_session_cookie(response: Response, user_id: int) -> None:
         "expires_at": int(time.time()) + SESSION_MAX_AGE_SECONDS,
     })
 
+    secure_cookie = _is_production_cookie_mode()
+
     response.set_cookie(
         key=SESSION_COOKIE_NAME,
         value=session,
         max_age=SESSION_MAX_AGE_SECONDS,
         path="/",
         httponly=True,
-        secure=False,
-        samesite="lax",
+        secure=secure_cookie,
+        samesite="none" if secure_cookie else "lax",
     )
 
 
 def clear_session_cookie(response: Response) -> None:
+    secure_cookie = _is_production_cookie_mode()
+
     response.delete_cookie(
         key=SESSION_COOKIE_NAME,
         path="/",
         httponly=True,
-        secure=False,
-        samesite="lax",
+        secure=secure_cookie,
+        samesite="none" if secure_cookie else "lax",
     )
 
 
