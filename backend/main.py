@@ -122,20 +122,8 @@ DUPLICATE_RESUME_MESSAGE = "This resume was already uploaded."
 
 
 def _is_production_cookie_mode() -> bool:
-    """Use secure cross-site cookies when the configured origins are HTTPS."""
-    cookie_mode = os.environ.get("COOKIE_SECURE_MODE", "").strip().lower()
-    if cookie_mode in {"1", "true", "yes", "on"}:
-        return True
-    if cookie_mode in {"0", "false", "no", "off"}:
-        return False
-
-    configured_origins = []
-    for env_name in ("FRONTEND_ORIGIN", "CORS_ALLOWED_ORIGINS"):
-        value = os.environ.get(env_name, "")
-        if value.strip():
-            configured_origins.extend(origin.strip() for origin in value.split(",") if origin.strip())
-
-    return any(origin.startswith("https://") for origin in configured_origins)
+    """Use secure cross-site cookies when explicitly enabled in the environment."""
+    return os.getenv("COOKIE_SECURE", "false").strip().lower() == "true"
 
 
 class AuthCredentials(BaseModel):
