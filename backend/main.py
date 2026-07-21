@@ -61,14 +61,35 @@ user_logger = get_logger("users")
 startup_logger = get_logger("startup")
 
 app = FastAPI()
+
+
+def _normalize_origin(origin: str) -> str:
+    return origin.strip().rstrip("/")
+
+
+allowed_origins = [
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+    "https://resumeai-frontend-pahy.onrender.com",
+]
+
+frontend_origin_env = os.environ.get("FRONTEND_ORIGIN", "")
+if frontend_origin_env.strip():
+    allowed_origins.append(_normalize_origin(frontend_origin_env))
+
+additional_origins_env = os.environ.get("CORS_ALLOWED_ORIGINS", "")
+if additional_origins_env.strip():
+    allowed_origins.extend(
+        _normalize_origin(origin)
+        for origin in additional_origins_env.split(",")
+        if origin.strip()
+    )
+
+allowed_origins = list(dict.fromkeys(allowed_origins))
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:5173",
-        "http://localhost:5174",
-        "http://127.0.0.1:5173",
-        "http://127.0.0.1:5174",
-    ],
+    allow_origins=allowed_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
