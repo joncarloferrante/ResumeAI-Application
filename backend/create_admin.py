@@ -6,6 +6,26 @@ from .auth_utils import hash_password
 from .database import create_user, get_user_by_email, init_db, update_user_role
 from .logging_config import get_logger
 
+try:
+    import psycopg2
+except ImportError:
+    try:
+        import psycopg
+    except ImportError:
+        psycopg2 = None
+        psycopg = None
+    else:
+        psycopg2 = None
+else:
+    psycopg = None
+
+if psycopg2 is not None:
+    DB_INTEGRITY_ERROR = (sqlite3.IntegrityError, psycopg2.IntegrityError)
+elif psycopg is not None:
+    DB_INTEGRITY_ERROR = (sqlite3.IntegrityError, psycopg.IntegrityError)
+else:
+    DB_INTEGRITY_ERROR = (sqlite3.IntegrityError,)
+
 VALID_ROLES = {"admin", "recruiter"}
 admin_logger = get_logger("admin")
 
@@ -59,7 +79,7 @@ def main() -> int:
 
     try:
         create_user(email, hash_password(password), role=role)
-    except sqlite3.IntegrityError:
+    except DB_INTEGRITY_ERROR:
         admin_logger.warning("User already exists: %s", email)
         return 1
 

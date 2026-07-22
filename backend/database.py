@@ -6,14 +6,37 @@ import time
 from collections import Counter
 from pathlib import Path
 import hashlib
+import os
+from urllib.parse import urlparse
 
 try:
     from openai import OpenAI
 except ImportError:
     OpenAI = None
 
+try:
+    import psycopg2
+    import psycopg2.extras
+except ImportError:
+    psycopg2 = None
+    psycopg2_extras = None
+    try:
+        import psycopg
+        import psycopg.rows
+    except ImportError:
+        psycopg = None
+        psycopg_rows = None
+    else:
+        psycopg_rows = psycopg.rows
+else:
+    psycopg2_extras = psycopg2.extras
+    psycopg = None
+    psycopg_rows = None
+
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DB_PATH = PROJECT_ROOT / "database" / "resumeai.db"
+DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
+USING_POSTGRES = DATABASE_URL.lower().startswith("postgres")
 VALID_ROLES = {"admin", "recruiter"}
 TOP_PYTHON_MATCHES = 8
 TOP_QWEN_MATCHES = 3
@@ -67,24 +90,352 @@ def _unique_username_from_email(email: str, used_usernames: set[str]) -> str:
     return candidate_username
 
 
+def _fetch_table_columns(conn, table_name: str) -> set[str]:
+    cursor = conn.cursor()
+    if USING_POSTGRES:
+        cursor.execute(
+            """
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_schema = CURRENT_SCHEMA()
+              AND table_name = %s
+            ORDER BY ordinal_position
+            """,
+            (table_name,),
+        )
+        return {row[0] for row in cursor.fetchall()}
+
+    cursor.execute(f"PRAGMA table_info({table_name})")
+    return {row[1] for row in cursor.fetchall()}
+
+
+class _PostgresCursor:
+    def __init__(self, cursor):
+        self._cursor = cursor
+        self.lastrowid = None
+        self.rowcount = -1
+
+    def _normalize_sql(self, sql: str) -> str:
+        normalized = sql.strip()
+        if normalized.startswith("PRAGMA table_info("):
+            table_name = normalized[len("PRAGMA table_info("):-1].strip('"')
+            return (
+                "SELECT column_name, data_type, is_nullable, column_default "
+                "FROM information_schema.columns "
+                "WHERE table_schema = CURRENT_SCHEMA() AND table_name = '%s' "
+                "ORDER BY ordinal_position"
+            ) % table_name
+        if "DATE('now')" in normalized:
+            normalized = normalized.replace("DATE('now')", "CURRENT_DATE")
+        if "json_extract(" in normalized:
+            normalized = normalized.replace(
+                "CAST(json_extract(mc.match_json, '$.match_score') AS REAL)",
+                "CAST((mc.match_json::jsonb ->> 'match_score') AS REAL)",
+            )
+            normalized = normalized.replace(
+                "CAST(json_extract(mc.match_json, '$.match_percentage') AS REAL)",
+                "CAST((mc.match_json::jsonb ->> 'match_percentage') AS REAL)",
+            )
+        normalized = normalized.replace(
+            """CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            email TEXT NOT NULL UNIQUE,
+            password_hash TEXT NOT NULL,
+            role TEXT NOT NULL DEFAULT 'recruiter',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )""",
+            """CREATE TABLE IF NOT EXISTS users (
+            id SERIAL PRIMARY KEY,
+            email TEXT NOT NULL UNIQUE,
+            password_hash TEXT NOT NULL,
+            role TEXT NOT NULL DEFAULT 'recruiter',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )""",
+        )
+        normalized = normalized.replace(
+            """CREATE TABLE IF NOT EXISTS candidates (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            filename TEXT,
+            candidate TEXT,
+            current_title TEXT,
+            email TEXT,
+            phone TEXT,
+            employment_status TEXT,
+            graduation_year TEXT,
+            total_experience_years REAL,
+            career_span_years REAL,
+            skills TEXT,
+            normalized_skills TEXT,
+            current_position TEXT,
+            current_company TEXT,
+            resume_summary TEXT,
+            needs_review TEXT,
+            industries TEXT,
+            certifications TEXT,
+            education TEXT,
+            keywords TEXT,
+            file_hash TEXT,
+            raw_json TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )""",
+            """CREATE TABLE IF NOT EXISTS candidates (
+            id SERIAL PRIMARY KEY,
+            filename TEXT,
+            candidate TEXT,
+            current_title TEXT,
+            email TEXT,
+            phone TEXT,
+            employment_status TEXT,
+            graduation_year TEXT,
+            total_experience_years REAL,
+            career_span_years REAL,
+            skills TEXT,
+            normalized_skills TEXT,
+            current_position TEXT,
+            current_company TEXT,
+            resume_summary TEXT,
+            needs_review TEXT,
+            industries TEXT,
+            certifications TEXT,
+            education TEXT,
+            keywords TEXT,
+            file_hash TEXT,
+            raw_json TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )""",
+        )
+        normalized = normalized.replace(
+            """CREATE TABLE IF NOT EXISTS audit_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            user_email TEXT,
+            action TEXT NOT NULL,
+            details TEXT,
+            status TEXT NOT NULL
+        )""",
+            """CREATE TABLE IF NOT EXISTS audit_logs (
+            id SERIAL PRIMARY KEY,
+            timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            user_email TEXT,
+            action TEXT NOT NULL,
+            details TEXT,
+            status TEXT NOT NULL
+        )""",
+        )
+        normalized = normalized.replace(
+            """CREATE TABLE IF NOT EXISTS jobs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            job_id TEXT UNIQUE,
+            title TEXT NOT NULL,
+            department TEXT,
+            location TEXT,
+            job_type TEXT,
+            status TEXT NOT NULL DEFAULT 'open',
+            description TEXT,
+            required_skills TEXT,
+            preferred_skills TEXT,
+            years_required TEXT,
+            industry TEXT,
+            certifications TEXT,
+            keywords TEXT,
+            salary TEXT,
+            created_by TEXT,
+            updated_by TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )""",
+            """CREATE TABLE IF NOT EXISTS jobs (
+            id SERIAL PRIMARY KEY,
+            job_id TEXT UNIQUE,
+            title TEXT NOT NULL,
+            department TEXT,
+            location TEXT,
+            job_type TEXT,
+            status TEXT NOT NULL DEFAULT 'open',
+            description TEXT,
+            required_skills TEXT,
+            preferred_skills TEXT,
+            years_required TEXT,
+            industry TEXT,
+            certifications TEXT,
+            keywords TEXT,
+            salary TEXT,
+            created_by TEXT,
+            updated_by TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )""",
+        )
+        normalized = normalized.replace(
+            """CREATE TABLE IF NOT EXISTS match_cache (
+            job_id INTEGER NOT NULL,
+            candidate_id INTEGER NOT NULL,
+            job_fingerprint TEXT NOT NULL,
+            candidate_fingerprint TEXT NOT NULL,
+            is_stale INTEGER NOT NULL DEFAULT 0,
+            match_json TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (job_id, candidate_id)
+            )""",
+            """CREATE TABLE IF NOT EXISTS match_cache (
+            job_id INTEGER NOT NULL,
+            candidate_id INTEGER NOT NULL,
+            job_fingerprint TEXT NOT NULL,
+            candidate_fingerprint TEXT NOT NULL,
+            is_stale INTEGER NOT NULL DEFAULT 0,
+            match_json TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (job_id, candidate_id)
+        )""",
+        )
+        normalized = normalized.replace(
+            """CREATE TABLE IF NOT EXISTS scraped_jobs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            title TEXT,
+            url TEXT NOT NULL UNIQUE,
+            location TEXT,
+            department TEXT,
+            employment_type TEXT,
+            job_number TEXT,
+            salary TEXT,
+            description TEXT,
+            active INTEGER NOT NULL DEFAULT 1,
+            last_scraped TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            manual_edited INTEGER NOT NULL DEFAULT 0,
+            manual_edited_at TIMESTAMP,
+            manual_edited_by TEXT,
+            source TEXT,
+            company TEXT,
+            responsibilities TEXT,
+            qualifications TEXT,
+            benefits TEXT,
+            apply_email_or_link TEXT,
+            additional_notes TEXT
+        )""",
+            """CREATE TABLE IF NOT EXISTS scraped_jobs (
+            id SERIAL PRIMARY KEY,
+            title TEXT,
+            url TEXT NOT NULL UNIQUE,
+            location TEXT,
+            department TEXT,
+            employment_type TEXT,
+            job_number TEXT,
+            salary TEXT,
+            description TEXT,
+            active INTEGER NOT NULL DEFAULT 1,
+            last_scraped TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            manual_edited INTEGER NOT NULL DEFAULT 0,
+            manual_edited_at TIMESTAMP,
+            manual_edited_by TEXT,
+            source TEXT,
+            company TEXT,
+            responsibilities TEXT,
+            qualifications TEXT,
+            benefits TEXT,
+            apply_email_or_link TEXT,
+            additional_notes TEXT
+        )""",
+        )
+        normalized = normalized.replace("?", "%s")
+        normalized = re.sub(r"INTEGER PRIMARY KEY AUTOINCREMENT", "SERIAL PRIMARY KEY", normalized, flags=re.IGNORECASE)
+        normalized = re.sub(r"\bAUTOINCREMENT\b", "", normalized, flags=re.IGNORECASE)
+        return normalized
+
+    def execute(self, sql, params=None):
+        translated = self._normalize_sql(sql)
+        params = tuple(params or ())
+        if translated.lstrip().upper().startswith("INSERT INTO USERS") and "RETURNING" not in translated.upper():
+            translated = translated.rstrip() + " RETURNING id"
+        elif translated.lstrip().upper().startswith("INSERT INTO CANDIDATES") and "RETURNING" not in translated.upper():
+            translated = translated.rstrip() + " RETURNING id"
+        elif translated.lstrip().upper().startswith("INSERT INTO AUDIT_LOGS") and "RETURNING" not in translated.upper():
+            translated = translated.rstrip() + " RETURNING id"
+        elif translated.lstrip().upper().startswith("INSERT INTO JOBS") and "RETURNING" not in translated.upper():
+            translated = translated.rstrip() + " RETURNING id"
+        self._cursor.execute(translated, params)
+        self.rowcount = self._cursor.rowcount
+        if translated.lstrip().upper().startswith("INSERT INTO") and "RETURNING ID" in translated.upper():
+            try:
+                row = self._cursor.fetchone()
+            except Exception:
+                row = None
+            if row:
+                self.lastrowid = row[0] if not isinstance(row, dict) else next(iter(row.values()))
+        return self
+
+    def fetchone(self):
+        return self._cursor.fetchone()
+
+    def fetchall(self):
+        return self._cursor.fetchall()
+
+    def __getattr__(self, item):
+        return getattr(self._cursor, item)
+
+
+class _PostgresConnection:
+    def __init__(self, conn):
+        self._conn = conn
+        self.autocommit = False
+
+    def cursor(self):
+        if psycopg2_extras is not None:
+            return _PostgresCursor(self._conn.cursor(cursor_factory=psycopg2_extras.RealDictCursor))
+        return _PostgresCursor(self._conn.cursor(row_factory=psycopg_rows.dict_row))
+
+    def commit(self):
+        return self._conn.commit()
+
+    def close(self):
+        return self._conn.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        if exc_type:
+            self._conn.rollback()
+        else:
+            self._conn.commit()
+        self.close()
+        return False
+
+    def __getattr__(self, item):
+        return getattr(self._conn, item)
+
+
 def get_connection():
     DB_PATH.parent.mkdir(exist_ok=True)
+    if USING_POSTGRES:
+        if psycopg2 is not None:
+            conn = psycopg2.connect(DATABASE_URL)
+        elif psycopg is not None:
+            conn = psycopg.connect(DATABASE_URL)
+        else:
+            raise RuntimeError("A PostgreSQL driver is required when DATABASE_URL is set.")
+        db_logger.info("PostgreSQL connected")
+        return _PostgresConnection(conn)
+
     conn = sqlite3.connect(DB_PATH)
     db_logger.info("SQLite connected")
     return conn
 
 
 def ensure_scraped_job_edit_columns(conn: sqlite3.Connection) -> None:
+    columns = _fetch_table_columns(conn, "scraped_jobs")
     cursor = conn.cursor()
-    cursor.execute("PRAGMA table_info(scraped_jobs)")
-    columns = {row[1] for row in cursor.fetchall()}
     for column_name, column_definition in {
         "manual_edited": "INTEGER NOT NULL DEFAULT 0",
         "manual_edited_at": "TIMESTAMP",
         "manual_edited_by": "TEXT",
     }.items():
         if column_name not in columns:
-            cursor.execute(f"ALTER TABLE scraped_jobs ADD COLUMN {column_name} {column_definition}")
+            if USING_POSTGRES:
+                cursor.execute(f"ALTER TABLE scraped_jobs ADD COLUMN IF NOT EXISTS {column_name} {column_definition}")
+            else:
+                cursor.execute(f"ALTER TABLE scraped_jobs ADD COLUMN {column_name} {column_definition}")
 
 
 def init_db():
@@ -102,8 +453,7 @@ def init_db():
         )
     """)
 
-    cursor.execute("PRAGMA table_info(users)")
-    user_columns = {row[1] for row in cursor.fetchall()}
+    user_columns = _fetch_table_columns(conn, "users")
     if "name" not in user_columns:
         cursor.execute("ALTER TABLE users ADD COLUMN name TEXT")
     if "username" not in user_columns:
@@ -177,8 +527,7 @@ def init_db():
         )
     """)
 
-    cursor.execute("PRAGMA table_info(candidates)")
-    candidate_columns = {row[1] for row in cursor.fetchall()}
+    candidate_columns = _fetch_table_columns(conn, "candidates")
     for column_name, column_definition in {
         "current_title": "TEXT",
         "industries": "TEXT",
@@ -201,8 +550,7 @@ def init_db():
         )
     """)
 
-    cursor.execute("PRAGMA table_info(audit_logs)")
-    audit_log_columns = {row[1] for row in cursor.fetchall()}
+    audit_log_columns = _fetch_table_columns(conn, "audit_logs")
     if "timestamp" not in audit_log_columns:
         cursor.execute("ALTER TABLE audit_logs ADD COLUMN timestamp TEXT")
     if "user_email" not in audit_log_columns:
@@ -248,8 +596,7 @@ def init_db():
         )
     """)
 
-    cursor.execute("PRAGMA table_info(jobs)")
-    job_columns = {row[1] for row in cursor.fetchall()}
+    job_columns = _fetch_table_columns(conn, "jobs")
     for column_name, column_definition in {
         "job_id": "TEXT UNIQUE",
         "department": "TEXT",
@@ -272,8 +619,7 @@ def init_db():
         if column_name not in job_columns:
             cursor.execute(f"ALTER TABLE jobs ADD COLUMN {column_name} {column_definition}")
 
-    cursor.execute("PRAGMA table_info(match_cache)")
-    match_cache_columns = {row[1] for row in cursor.fetchall()}
+    match_cache_columns = _fetch_table_columns(conn, "match_cache")
     if "is_stale" not in match_cache_columns:
         cursor.execute("ALTER TABLE match_cache ADD COLUMN is_stale INTEGER NOT NULL DEFAULT 0")
 

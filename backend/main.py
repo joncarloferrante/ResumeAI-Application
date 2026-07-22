@@ -14,6 +14,26 @@ import threading
 from dotenv import load_dotenv
 load_dotenv()
 
+try:
+    import psycopg2
+except ImportError:
+    try:
+        import psycopg
+    except ImportError:
+        psycopg2 = None
+        psycopg = None
+    else:
+        psycopg2 = None
+else:
+    psycopg = None
+
+if psycopg2 is not None:
+    DB_INTEGRITY_ERROR = (sqlite3.IntegrityError, psycopg2.IntegrityError)
+elif psycopg is not None:
+    DB_INTEGRITY_ERROR = (sqlite3.IntegrityError, psycopg.IntegrityError)
+else:
+    DB_INTEGRITY_ERROR = (sqlite3.IntegrityError,)
+
 from .auth_utils import hash_password, verify_password
 from .resume_parser import parse_resume_file
 from .database import (
@@ -361,7 +381,7 @@ def register(credentials: AuthCredentials, response: Response):
 
     try:
         user_id = create_user(email, hash_password(credentials.password))
-    except sqlite3.IntegrityError:
+    except DB_INTEGRITY_ERROR:
         raise HTTPException(status_code=400, detail="An account with that email already exists.")
 
     user = get_user_by_id(user_id)
@@ -443,7 +463,7 @@ def create_user_account(payload: UserCreatePayload, current_user: dict = Depends
             name=name,
             username=username,
         )
-    except sqlite3.IntegrityError:
+    except DB_INTEGRITY_ERROR:
         raise HTTPException(status_code=400, detail="That email or username is already in use.")
 
     created_user = get_user_by_id(user_id)
@@ -478,7 +498,7 @@ def update_user_account(user_id: int, payload: UserUpdatePayload, current_user: 
 
     try:
         update_user(user_id, name, username, email, payload.role)
-    except sqlite3.IntegrityError:
+    except DB_INTEGRITY_ERROR:
         raise HTTPException(status_code=400, detail="That email or username is already in use.")
 
     updated_user = get_user_by_id(user_id)

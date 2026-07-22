@@ -3,11 +3,12 @@ import json
 import re
 import sqlite3
 from datetime import datetime, timezone
-from pathlib import Path
 from urllib.parse import urljoin
 
 import requests
 from bs4 import BeautifulSoup
+from pathlib import Path
+from ..database import get_connection
 
 # This scraper is intentionally separate from the Atlantic Group scraper.
 # It only targets the Blair & Potts careers page and prints normalized results
@@ -18,7 +19,6 @@ SOURCE_NAME = "Blair & Potts"
 COMPANY_NAME = "Blair & Potts"
 REQUEST_TIMEOUT = 30
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-DB_PATH = PROJECT_ROOT / "database" / "resumeai.db"
 DEBUG_HTML = False
 FOOTER_STOP_MARKERS = [
     "Two Stamford Plaza",
@@ -355,7 +355,7 @@ def detect_application_link(job_section) -> str:
 
 def ensure_scraped_jobs_table() -> None:
     """Ensure the shared scraped_jobs table can store multiple jobs from one source URL."""
-    with sqlite3.connect(DB_PATH) as conn:
+    with get_connection() as conn:
         cursor = conn.cursor()
         cursor.execute("PRAGMA table_info(scraped_jobs)")
         columns = {row[1] for row in cursor.fetchall()}
@@ -570,7 +570,7 @@ def save_blair_potts_jobs(jobs: list[dict]) -> tuple[int, int, int, int]:
     inserted = updated = unchanged = 0
     seen_keys: set[str] = set()
 
-    with sqlite3.connect(DB_PATH) as conn:
+    with get_connection() as conn:
         conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
 

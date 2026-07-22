@@ -3,17 +3,15 @@ import logging
 import re
 import sqlite3
 import time
-from pathlib import Path
 from urllib.parse import urljoin, urlparse
 
 from bs4 import BeautifulSoup
 from playwright.sync_api import sync_playwright
+from ..database import get_connection
 from ..logging_config import get_logger
 
 START_URL = "https://atlanticrecruiters.com/job-postings/"
 BASE_URL = "https://atlanticrecruiters.com"
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
-DB_PATH = PROJECT_ROOT / "database" / "resumeai.db"
 IGNORED_LINK_TEXTS = {
     "home",
     "jobs",
@@ -63,7 +61,7 @@ def extract_field(pattern: str, text: str) -> str:
 
 
 def ensure_scraped_jobs_table() -> None:
-    with sqlite3.connect(DB_PATH) as conn:
+    with get_connection() as conn:
         conn.execute("""
             CREATE TABLE IF NOT EXISTS scraped_jobs (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -221,7 +219,7 @@ def extract_job_details(job_url: str) -> dict[str, str]:
 
 
 def save_scraped_job(job: dict[str, str]) -> str:
-    with sqlite3.connect(DB_PATH) as conn:
+    with get_connection() as conn:
         cursor = conn.cursor()
         cursor.execute("""
             SELECT id
@@ -296,7 +294,7 @@ def save_scraped_job(job: dict[str, str]) -> str:
 
 
 def mark_missing_jobs_inactive(active_urls: set[str]) -> int:
-    with sqlite3.connect(DB_PATH) as conn:
+    with get_connection() as conn:
         cursor = conn.cursor()
         if not active_urls:
             cursor.execute(

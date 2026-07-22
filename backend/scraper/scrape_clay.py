@@ -8,6 +8,7 @@ from pathlib import Path
 
 import requests
 from bs4 import BeautifulSoup
+from ..database import get_connection
 
 START_URL = "https://www.clay.com/jobs"
 JOB_BOARD_URL = "https://jobs.ashbyhq.com/claylabs?embed=js"
@@ -16,7 +17,6 @@ SOURCE_NAME = "clay"
 COMPANY_NAME = "Clay"
 REQUEST_TIMEOUT = 30
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-DB_PATH = PROJECT_ROOT / "database" / "resumeai.db"
 DEBUG_HTML = False
 
 
@@ -453,7 +453,7 @@ def scrape_clay_jobs() -> list[dict]:
 
 
 def ensure_scraped_jobs_table() -> None:
-    with sqlite3.connect(DB_PATH) as conn:
+    with get_connection() as conn:
         cursor = conn.cursor()
         cursor.execute("PRAGMA table_info(scraped_jobs)")
         columns = {row[1] for row in cursor.fetchall()}
@@ -476,7 +476,7 @@ def save_clay_jobs(jobs: list[dict]) -> tuple[int, int, int, int]:
     inserted = updated = unchanged = 0
     seen_keys: set[str] = set()
 
-    with sqlite3.connect(DB_PATH) as conn:
+    with get_connection() as conn:
         conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
 
