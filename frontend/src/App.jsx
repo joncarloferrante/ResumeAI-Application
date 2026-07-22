@@ -4190,6 +4190,9 @@ function App() {
                   <DetailItem label="Created/upload date" value={selectedCandidate.created_at} />
                   <DetailItem label="Summary" value={selectedCandidate.resume_summary} />
                 </dl>
+                <p className="subtitle">
+                  Resume preview is not available in this view. The candidate record is still fully accessible.
+                </p>
               </section>
             </div>
           </section>
@@ -5149,9 +5152,11 @@ function DetailItem({ icon: Icon, label, value }) {
   return (
     <div className="detail-item">
       <dt>
-        <span className="detail-item-icon" aria-hidden="true">
-          <Icon />
-        </span>
+        {Icon ? (
+          <span className="detail-item-icon" aria-hidden="true">
+            <Icon />
+          </span>
+        ) : null}
         <span>{label}</span>
       </dt>
       <dd>{formatValue(value)}</dd>
