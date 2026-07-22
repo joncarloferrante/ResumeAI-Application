@@ -139,6 +139,12 @@ def _fetch_table_columns(conn, table_name: str) -> set[str]:
     return {row[1] for row in cursor.fetchall()}
 
 
+def _row_value(row, column_name: str, index: int):
+    if isinstance(row, dict):
+        return row.get(column_name)
+    return row[index]
+
+
 class _PostgresCursor:
     def __init__(self, cursor):
         self._cursor = cursor
@@ -518,21 +524,26 @@ def init_db():
     """)
     existing_usernames: set[str] = set()
     for row in cursor.fetchall():
-        normalized_username = str(row[3] or "").strip().lower()
-        desired_username = normalized_username or _unique_username_from_email(str(row[1] or ""), existing_usernames)
+        row_id = _row_value(row, "id", 0)
+        email = _row_value(row, "email", 1)
+        name = _row_value(row, "name", 2)
+        username = _row_value(row, "username", 3)
+
+        normalized_username = str(username or "").strip().lower()
+        desired_username = normalized_username or _unique_username_from_email(str(email or ""), existing_usernames)
         if normalized_username and normalized_username in existing_usernames:
-            desired_username = _unique_username_from_email(str(row[1] or ""), existing_usernames)
+            desired_username = _unique_username_from_email(str(email or ""), existing_usernames)
         else:
             existing_usernames.add(desired_username.lower())
 
-        desired_name = str(row[2] or "").strip() or _display_name_from_email(str(row[1] or ""))
+        desired_name = str(name or "").strip() or _display_name_from_email(str(email or ""))
 
-        if desired_name != row[2] or desired_username != row[3]:
+        if desired_name != name or desired_username != username:
             cursor.execute("""
                 UPDATE users
                 SET name = ?, username = ?
                 WHERE id = ?
-            """, (desired_name, desired_username, row[0]))
+            """, (desired_name, desired_username, row_id))
 
     cursor.execute("""
         CREATE UNIQUE INDEX IF NOT EXISTS idx_users_username
