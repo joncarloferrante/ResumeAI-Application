@@ -1614,14 +1614,14 @@ def _store_cached_match(job_id: int, candidate_id: int, job_fingerprint: str, ca
     if saved_row:
         saved_match = {}
         try:
-            saved_match = json.loads(saved_row[5] or "{}")
+            saved_match = json.loads(_row_value(saved_row, "match_json", 5) or "{}")
         except json.JSONDecodeError:
             saved_match = {}
         matcher_logger.info(
             "Match saved | job_id=%s | candidate_id=%s | stale=%s | saved_match_score=%s | saved_match_percentage=%s",
-            saved_row[0],
-            saved_row[1],
-            bool(saved_row[4]),
+            _row_value(saved_row, "job_id", 0),
+            _row_value(saved_row, "candidate_id", 1),
+            bool(_row_value(saved_row, "is_stale", 4)),
             saved_match.get("match_score"),
             saved_match.get("match_percentage"),
         )
