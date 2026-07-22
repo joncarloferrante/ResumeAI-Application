@@ -103,7 +103,7 @@ def _fetch_table_columns(conn, table_name: str) -> set[str]:
             """,
             (table_name,),
         )
-        return {row[0] for row in cursor.fetchall()}
+        return {str(row["column_name"]) for row in cursor.fetchall()}
 
     cursor.execute(f"PRAGMA table_info({table_name})")
     return {row[1] for row in cursor.fetchall()}
