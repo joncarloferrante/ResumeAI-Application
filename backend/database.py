@@ -58,6 +58,36 @@ SCRAPED_JOB_EDITABLE_COLUMNS = [
     "additional_notes",
     "active",
 ]
+SCRAPED_JOBS_TABLE_SQL = """
+    CREATE TABLE IF NOT EXISTS scraped_jobs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        title TEXT,
+        url TEXT NOT NULL UNIQUE,
+        job_key TEXT,
+        source_job_id TEXT,
+        location TEXT,
+        department TEXT,
+        employment_type TEXT,
+        job_number TEXT,
+        salary TEXT,
+        description TEXT,
+        active INTEGER NOT NULL DEFAULT 1,
+        last_scraped TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        source TEXT,
+        company TEXT,
+        responsibilities TEXT,
+        qualifications TEXT,
+        benefits TEXT,
+        apply_email_or_link TEXT,
+        apply_url TEXT,
+        workplace_type TEXT,
+        posted_date TEXT,
+        manual_edited INTEGER NOT NULL DEFAULT 0,
+        manual_edited_at TIMESTAMP,
+        manual_edited_by TEXT,
+        additional_notes TEXT
+    )
+"""
 
 from .logging_config import get_logger
 
@@ -295,6 +325,8 @@ class _PostgresCursor:
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             title TEXT,
             url TEXT NOT NULL UNIQUE,
+            job_key TEXT,
+            source_job_id TEXT,
             location TEXT,
             department TEXT,
             employment_type TEXT,
@@ -303,21 +335,26 @@ class _PostgresCursor:
             description TEXT,
             active INTEGER NOT NULL DEFAULT 1,
             last_scraped TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            manual_edited INTEGER NOT NULL DEFAULT 0,
-            manual_edited_at TIMESTAMP,
-            manual_edited_by TEXT,
             source TEXT,
             company TEXT,
             responsibilities TEXT,
             qualifications TEXT,
             benefits TEXT,
             apply_email_or_link TEXT,
+            apply_url TEXT,
+            workplace_type TEXT,
+            posted_date TEXT,
+            manual_edited INTEGER NOT NULL DEFAULT 0,
+            manual_edited_at TIMESTAMP,
+            manual_edited_by TEXT,
             additional_notes TEXT
         )""",
             """CREATE TABLE IF NOT EXISTS scraped_jobs (
             id SERIAL PRIMARY KEY,
             title TEXT,
             url TEXT NOT NULL UNIQUE,
+            job_key TEXT,
+            source_job_id TEXT,
             location TEXT,
             department TEXT,
             employment_type TEXT,
@@ -326,15 +363,18 @@ class _PostgresCursor:
             description TEXT,
             active INTEGER NOT NULL DEFAULT 1,
             last_scraped TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            manual_edited INTEGER NOT NULL DEFAULT 0,
-            manual_edited_at TIMESTAMP,
-            manual_edited_by TEXT,
             source TEXT,
             company TEXT,
             responsibilities TEXT,
             qualifications TEXT,
             benefits TEXT,
             apply_email_or_link TEXT,
+            apply_url TEXT,
+            workplace_type TEXT,
+            posted_date TEXT,
+            manual_edited INTEGER NOT NULL DEFAULT 0,
+            manual_edited_at TIMESTAMP,
+            manual_edited_by TEXT,
             additional_notes TEXT
         )""",
         )
@@ -622,6 +662,31 @@ def init_db():
     match_cache_columns = _fetch_table_columns(conn, "match_cache")
     if "is_stale" not in match_cache_columns:
         cursor.execute("ALTER TABLE match_cache ADD COLUMN is_stale INTEGER NOT NULL DEFAULT 0")
+
+    cursor.execute(SCRAPED_JOBS_TABLE_SQL)
+    scraped_job_columns = _fetch_table_columns(conn, "scraped_jobs")
+    for column_name, column_definition in {
+        "job_key": "TEXT",
+        "source_job_id": "TEXT",
+        "apply_url": "TEXT",
+        "workplace_type": "TEXT",
+        "posted_date": "TEXT",
+        "manual_edited": "INTEGER NOT NULL DEFAULT 0",
+        "manual_edited_at": "TIMESTAMP",
+        "manual_edited_by": "TEXT",
+        "source": "TEXT",
+        "company": "TEXT",
+        "responsibilities": "TEXT",
+        "qualifications": "TEXT",
+        "benefits": "TEXT",
+        "apply_email_or_link": "TEXT",
+        "additional_notes": "TEXT",
+    }.items():
+        if column_name not in scraped_job_columns:
+            if USING_POSTGRES:
+                cursor.execute(f"ALTER TABLE scraped_jobs ADD COLUMN IF NOT EXISTS {column_name} {column_definition}")
+            else:
+                cursor.execute(f"ALTER TABLE scraped_jobs ADD COLUMN {column_name} {column_definition}")
 
     conn.commit()
     conn.close()
