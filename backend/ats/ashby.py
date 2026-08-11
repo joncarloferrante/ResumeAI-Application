@@ -238,14 +238,16 @@ def ensure_scraped_jobs_table() -> None:
 
 def _values_differ(existing: dict, stored: dict, fields: list[str]) -> bool:
     for field in fields:
-        if str(existing.get(field) or "") != str(stored.get(field) or ""):
+        existing_value = existing[field] if isinstance(existing, (sqlite3.Row, dict)) else getattr(existing, field, "")
+        if str(existing_value or "") != str(stored.get(field) or ""):
             return True
     return False
 
 
-def upsert_normalized_jobs(source: dict, jobs: list[dict]) -> tuple[int, int, int]:
+def upsert_normalized_jobs(source: dict, jobs: list[dict]) -> tuple[int, int, int, int]:
     ensure_scraped_jobs_table()
     inserted = updated = skipped = failed = 0
+    seen_keys: set[str] = set()
     with get_connection() as conn:
         conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
@@ -336,7 +338,7 @@ def upsert_normalized_jobs(source: dict, jobs: list[dict]) -> tuple[int, int, in
 
         conn.commit()
 
-    return inserted, updated, skipped
+    return inserted, updated, skipped, failed
 
 
 class AshbyAdapter(ATSAdapter):

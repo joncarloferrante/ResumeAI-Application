@@ -16,7 +16,7 @@ def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def upsert_jobs_for_source(source: dict, jobs: list[dict]) -> tuple[int, int, int]:
+def upsert_jobs_for_source(source: dict, jobs: list[dict]) -> tuple[int, int, int, int]:
     from .ashby import upsert_normalized_jobs
 
     return upsert_normalized_jobs(source, jobs)
@@ -88,7 +88,7 @@ def sync_job_source(source_id: int) -> dict:
         normalized_url = adapter.normalize_careers_url(source["careers_url"])
         jobs = adapter.fetch_jobs(normalized_url)
         source["careers_url"] = normalized_url
-        inserted, updated, skipped = upsert_jobs_for_source(source, jobs)
+        inserted, updated, skipped, failed = upsert_jobs_for_source(source, jobs)
         seen_job_keys = {job.get("job_key") for job in jobs if job.get("job_key")}
         inactivated = _mark_missing_jobs_inactive(source, seen_job_keys)
         update_job_source_sync_result(
@@ -108,8 +108,8 @@ def sync_job_source(source_id: int) -> dict:
             "jobs_updated": updated,
             "jobs_skipped": skipped,
             "jobs_inactivated": inactivated,
-            "jobs_failed": 0,
-            "status": "success",
+            "jobs_failed": failed,
+            "status": "success" if failed == 0 else "failed",
         }
     except Exception as exc:
         update_job_source_sync_result(
