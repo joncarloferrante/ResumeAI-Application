@@ -9,7 +9,7 @@ from urllib.parse import urlparse, urlunparse
 import requests
 from bs4 import BeautifulSoup
 
-from ..database import get_connection
+from ..database import get_connection, _fetch_table_columns
 from ..logging_config import get_logger
 from .base import ATSAdapter, ATSImportResult
 
@@ -212,8 +212,7 @@ def load_jobs_from_board(careers_url: str) -> tuple[str, str, list[dict]]:
 def ensure_scraped_jobs_table() -> None:
     with get_connection() as conn:
         cursor = conn.cursor()
-        cursor.execute("PRAGMA table_info(scraped_jobs)")
-        columns = {row[1] for row in cursor.fetchall()}
+        columns = _fetch_table_columns(conn, "scraped_jobs")
         for column_name, definition in {
             "job_key": "TEXT",
             "source_job_id": "TEXT",
