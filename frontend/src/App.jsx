@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+﻿import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import api from "./api";
 import "./App.css";
 
@@ -331,7 +331,7 @@ function splitJobDescription(description) {
   }, {});
 
   const headingPatterns = [
-    { key: "overview", pattern: /job overview\s*[-:–—]?\s*/gi },
+    { key: "overview", pattern: /job overview\s*[-:â€“â€”]?\s*/gi },
     { key: "responsibilities", pattern: /responsibilities(?:\s+as)?\s*(?:the|a|an)?[^:\n]*:\s*/gi },
     { key: "qualifications", pattern: /qualifications(?:\s+for)?\s*(?:the|a|an)?[^:\n]*:\s*/gi },
     { key: "benefits", pattern: /benefits(?:\s+and\s+perks)?\s*:\s*/gi },
@@ -434,7 +434,7 @@ function buildOverviewParagraphs(job) {
   }
 
   const titleText = cleanJobText(job?.title || "");
-  const sectionBoundaryPattern = /\b(?:Responsibilities|Qualifications|Benefits|Additional Notes|What You’ll Do|What You'll Do|What You’ll Bring|What You'll Bring|What We Offer|What We Provide|Compensation|Salary)\b/i;
+  const sectionBoundaryPattern = /\b(?:Responsibilities|Qualifications|Benefits|Additional Notes|What Youâ€™ll Do|What You'll Do|What Youâ€™ll Bring|What You'll Bring|What We Offer|What We Provide|Compensation|Salary)\b/i;
   const titleIndex = titleText ? jobText.toLowerCase().indexOf(titleText.toLowerCase()) : -1;
 
   let overviewSource = "";
@@ -530,7 +530,7 @@ function extractExperienceRequirements(job, sections = {}) {
     }
 
     const segments = text
-      .split(/\n|[••]\s*|\.\s+(?=[A-Z0-9])/)
+      .split(/\n|[â€¢â€¢]\s*|\.\s+(?=[A-Z0-9])/)
       .map((segment) => cleanJobText(segment))
       .filter(Boolean);
 
@@ -1526,7 +1526,7 @@ function App() {
       return "";
     }
 
-    return sortConfig.direction === "asc" ? " ▲" : " ▼";
+    return sortConfig.direction === "asc" ? " â–²" : " â–¼";
   };
 
   const closeCandidateDetails = () => {
@@ -3441,56 +3441,59 @@ function App() {
                 <p className="subtitle">Imported sources can be synced again or disabled without deleting jobs.</p>
               </div>
             </div>
-            <div className="saved-sources-list">
-              {savedJobSources.length === 0 ? (
-                <div className="empty-state saved-sources-empty">No saved ATS sources yet.</div>
-              ) : (
-                savedJobSources.map((source) => (
-                  <article key={source.id} className={`saved-source-card ${source.enabled ? "" : "is-disabled"}`}>
-                    <div className="saved-source-main">
-                      <div>
-                        <div className="saved-source-title-row">
-                          <h3>{formatDetailValue(source.company_name, "Unnamed company")}</h3>
-                          <span className={`status-pill ${source.enabled ? "status-pill--success" : "status-pill--muted"}`}>
-                            {source.enabled ? "Enabled" : "Disabled"}
+            <div className="table-shell saved-sources-table-shell">
+              <table className="data-table saved-sources-table">
+                <thead>
+                  <tr>
+                    <th>Company</th>
+                    <th>ATS</th>
+                    <th>Jobs</th>
+                    <th>Last Sync</th>
+                    <th>Status</th>
+                    <th className="actions-column">Actions</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {savedJobSources.length === 0 ? (
+                    <tr>
+                      <td className="empty-state" colSpan="6">
+                        No saved ATS sources yet.
+                      </td>
+                    </tr>
+                  ) : (
+                    savedJobSources.map((source) => (
+                      <tr key={source.id} className={source.enabled ? "" : "is-disabled"}>
+                        <td>
+                          <div className="saved-source-compact-main">
+                            <strong>{formatDetailValue(source.company_name, "Unnamed company")}</strong>
+                            <span className="saved-source-compact-subtle">
+                              {formatDetailValue(source.source_slug, "No slug")} {source.enabled ? "· Enabled" : "· Disabled"}
+                            </span>
+                          </div>
+                        </td>
+                        <td>{formatDetailValue(source.source_type, "Unknown ATS")}</td>
+                        <td>{formatMetric(source.last_sync_job_count)}</td>
+                        <td>{formatDate(source.last_sync_at)}</td>
+                        <td>
+                          <span className={`status-pill ${source.last_sync_status === "success" ? "status-pill--success" : "status-pill--muted"}`}>
+                            {source.last_sync_status === "success" ? "Success" : formatDetailValue(source.last_sync_status, "Never synced")}
                           </span>
-                        </div>
-                        <p className="saved-source-provider">
-                          {formatDetailValue(source.source_type, "Unknown ATS")} · {formatDetailValue(source.source_slug, "No slug")}
-                        </p>
-                      </div>
-
-                      <p className="saved-source-url">{formatDetailValue(source.careers_url, "No careers URL saved")}</p>
-                    </div>
-
-                    <div className="saved-source-meta">
-                      <div>
-                        <span>Last Sync</span>
-                        <strong>{formatDate(source.last_sync_at)}</strong>
-                      </div>
-                      <div>
-                        <span>Status</span>
-                        <strong>{formatDetailValue(source.last_sync_status, "Never synced")}</strong>
-                      </div>
-                      <div>
-                        <span>Jobs Seen</span>
-                        <strong>{formatMetric(source.last_sync_job_count)}</strong>
-                      </div>
-                    </div>
-
-                    {source.last_sync_error ? <p className="saved-source-error">{source.last_sync_error}</p> : null}
-
-                    <div className="saved-source-actions">
-                      <button className="view-button" type="button" onClick={() => handleSyncSource(source.id)} disabled={!source.enabled}>
-                        Sync
-                      </button>
-                      <button className="secondary-button" type="button" onClick={() => handleDisableSource(source.id)} disabled={!source.enabled}>
-                        Disable
-                      </button>
-                    </div>
-                  </article>
-                ))
-              )}
+                        </td>
+                        <td className="actions-column">
+                          <div className="inline-actions compact-inline-actions">
+                            <button className="view-button compact-button" type="button" onClick={() => handleSyncSource(source.id)} disabled={!source.enabled}>
+                              Sync
+                            </button>
+                            <button className="secondary-button compact-button" type="button" onClick={() => handleDisableSource(source.id)} disabled={!source.enabled}>
+                              Disable
+                            </button>
+                          </div>
+                        </td>
+                      </tr>
+                    ))
+                  )}
+                </tbody>
+              </table>
             </div>
           </section>
         )}
@@ -5380,3 +5383,5 @@ function JobDetailSection({ title, content }) {
 }
 
 export default App;
+
+
