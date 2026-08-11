@@ -243,11 +243,9 @@ def _values_differ(existing: dict, stored: dict, fields: list[str]) -> bool:
     return False
 
 
-def upsert_ashby_jobs(careers_url: str, jobs: list[dict]) -> tuple[int, int, int, int]:
+def upsert_normalized_jobs(source: dict, jobs: list[dict]) -> tuple[int, int, int]:
     ensure_scraped_jobs_table()
     inserted = updated = skipped = failed = 0
-    seen_keys: set[str] = set()
-
     with get_connection() as conn:
         conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
@@ -333,16 +331,22 @@ def upsert_ashby_jobs(careers_url: str, jobs: list[dict]) -> tuple[int, int, int
                     )
                     inserted += 1
             except Exception:
-                logger.exception("Ashby job import failed | careers_url=%s", careers_url)
+                logger.exception("ATS job import failed | careers_url=%s", source.get("careers_url"))
                 failed += 1
 
         conn.commit()
 
-    return inserted, updated, skipped, failed
+    return inserted, updated, skipped
 
 
 class AshbyAdapter(ATSAdapter):
     source_name = SOURCE_NAME
+
+    def normalize_careers_url(self, careers_url: str) -> str:
+        return normalize_careers_url(careers_url)
+
+    def extract_company_slug(self, careers_url: str) -> str:
+        return extract_company_slug(careers_url)
 
     def matches(self, careers_url: str) -> bool:
         raw_url = careers_url.strip()
@@ -351,17 +355,26 @@ class AshbyAdapter(ATSAdapter):
         parsed = urlparse(raw_url)
         return ASHBY_HOST in parsed.netloc.lower() or ASHBY_HOST in parsed.path.lower()
 
-    def import_jobs(self, careers_url: str) -> ATSImportResult:
-        normalized_url, company_slug, jobs = load_jobs_from_board(careers_url)
-        inserted, updated, skipped, failed = upsert_ashby_jobs(normalized_url, jobs)
+    def fetch_jobs(self, careers_url: str) -> list[dict]:
+        return load_jobs_from_board(careers_url)[2]
+
+    def build_import_result(
+        self,
+        careers_url: str,
+        jobs_found: int,
+        jobs_added: int,
+        jobs_updated: int,
+        jobs_skipped: int,
+        jobs_failed: int,
+    ) -> ATSImportResult:
         return ATSImportResult(
             source=SOURCE_NAME,
-            company=company_slug,
-            careers_url=normalized_url,
+            company=extract_company_slug(normalize_careers_url(careers_url)),
+            careers_url=normalize_careers_url(careers_url),
             detected_ats=SOURCE_NAME,
-            jobs_found=len(jobs),
-            jobs_added=inserted,
-            jobs_updated=updated,
-            jobs_skipped=skipped,
-            jobs_failed=failed,
+            jobs_found=jobs_found,
+            jobs_added=jobs_added,
+            jobs_updated=jobs_updated,
+            jobs_skipped=jobs_skipped,
+            jobs_failed=jobs_failed,
         )

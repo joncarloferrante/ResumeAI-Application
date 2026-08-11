@@ -21,10 +21,29 @@ class ATSAdapter(ABC):
     source_name: str
 
     @abstractmethod
+    def normalize_careers_url(self, careers_url: str) -> str:
+        raise NotImplementedError
+
+    @abstractmethod
+    def extract_company_slug(self, careers_url: str) -> str:
+        raise NotImplementedError
+
+    @abstractmethod
     def matches(self, careers_url: str) -> bool:
         raise NotImplementedError
 
     @abstractmethod
-    def import_jobs(self, careers_url: str) -> ATSImportResult:
+    def fetch_jobs(self, careers_url: str) -> list[dict]:
         raise NotImplementedError
 
+    @abstractmethod
+    def build_import_result(
+        self,
+        careers_url: str,
+        jobs_found: int,
+        jobs_added: int,
+        jobs_updated: int,
+        jobs_skipped: int,
+        jobs_failed: int,
+    ) -> ATSImportResult:
+        raise NotImplementedError

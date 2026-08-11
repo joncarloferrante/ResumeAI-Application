@@ -16,6 +16,12 @@ def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def upsert_jobs_for_source(source: dict, jobs: list[dict]) -> tuple[int, int, int]:
+    from .ashby import upsert_normalized_jobs
+
+    return upsert_normalized_jobs(source, jobs)
+
+
 def _mark_missing_jobs_inactive(source: dict, seen_job_keys: set[str]) -> int:
     if not seen_job_keys:
         return 0
@@ -49,12 +55,10 @@ def _mark_missing_jobs_inactive(source: dict, seen_job_keys: set[str]) -> int:
 def register_or_update_job_source(careers_url: str) -> dict:
     adapter = detect_adapter(careers_url)
     if not adapter:
-        raise ValueError("Unsupported ATS URL.")
+        raise ValueError("This careers platform is not supported yet.")
 
-    from .ashby import extract_company_slug, normalize_careers_url
-
-    normalized_url = normalize_careers_url(careers_url)
-    company_slug = extract_company_slug(normalized_url)
+    normalized_url = adapter.normalize_careers_url(careers_url)
+    company_slug = adapter.extract_company_slug(normalized_url)
     source = save_job_source(
         {
             "company_name": company_slug,
@@ -77,14 +81,14 @@ def sync_job_source(source_id: int) -> dict:
 
     adapter = detect_adapter(source["careers_url"])
     if not adapter:
-        raise ValueError("Unsupported ATS source.")
-
-    from .ashby import load_jobs_from_board, upsert_ashby_jobs
+        raise ValueError("This careers platform is not supported yet.")
 
     now = _utc_now()
     try:
-        _, _, jobs = load_jobs_from_board(source["careers_url"])
-        inserted, updated, skipped, failed = upsert_ashby_jobs(source["careers_url"], jobs)
+        normalized_url = adapter.normalize_careers_url(source["careers_url"])
+        jobs = adapter.fetch_jobs(normalized_url)
+        source["careers_url"] = normalized_url
+        inserted, updated, skipped = upsert_jobs_for_source(source, jobs)
         seen_job_keys = {job.get("job_key") for job in jobs if job.get("job_key")}
         inactivated = _mark_missing_jobs_inactive(source, seen_job_keys)
         update_job_source_sync_result(
@@ -104,7 +108,7 @@ def sync_job_source(source_id: int) -> dict:
             "jobs_updated": updated,
             "jobs_skipped": skipped,
             "jobs_inactivated": inactivated,
-            "jobs_failed": failed,
+            "jobs_failed": 0,
             "status": "success",
         }
     except Exception as exc:

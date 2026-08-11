@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 from .ashby import AshbyAdapter
+from .greenhouse import GreenhouseAdapter
+from .lever import LeverAdapter
 
 
-ADAPTERS = [AshbyAdapter()]
+ADAPTERS = [AshbyAdapter(), GreenhouseAdapter(), LeverAdapter()]
 
 
 def detect_adapter(careers_url: str):
@@ -11,4 +13,3 @@ def detect_adapter(careers_url: str):
         if adapter.matches(careers_url):
             return adapter
     return None
-

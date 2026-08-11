@@ -2212,7 +2212,7 @@ function App() {
     }
   };
 
-  const handleAshbyImport = async (event) => {
+  const handleCareersPageImport = async (event) => {
     event.preventDefault();
     setIsImportingAshby(true);
     setAshbyImportMessage("");
@@ -2229,7 +2229,7 @@ function App() {
     } catch (error) {
       console.error(error);
       const detail = error.response?.data?.detail;
-      setAshbyImportMessage(detail || "Could not import Ashby jobs.");
+      setAshbyImportMessage(detail || "Could not import careers page jobs.");
     } finally {
       setIsImportingAshby(false);
     }
@@ -3371,9 +3371,9 @@ function App() {
 
           <div className="job-board-header-actions">
             {isAdmin && (
-              <form className="job-import-form" onSubmit={handleAshbyImport}>
+              <form className="job-import-form" onSubmit={handleCareersPageImport}>
                 <label className="audit-filter job-import-field">
-                  <span>Ashby careers URL</span>
+                  <span>Careers Page URL</span>
                   <input
                     type="url"
                     value={ashbyImportUrl}
@@ -3383,7 +3383,7 @@ function App() {
                   />
                 </label>
                 <button className="secondary-button" type="submit" disabled={isImportingAshby}>
-                  {isImportingAshby ? "Importing..." : "Import Ashby Jobs"}
+                  {isImportingAshby ? "Importing..." : "Import Careers Page"}
                 </button>
               </form>
             )}
