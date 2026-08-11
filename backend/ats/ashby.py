@@ -322,7 +322,7 @@ def upsert_ashby_jobs(careers_url: str, jobs: list[dict]) -> tuple[int, int, int
                             source, company, source_job_id, title, url, apply_url, location, department, employment_type,
                             source_slug, job_number, workplace_type, salary, description, responsibilities, qualifications, benefits,
                             posted_date, active, last_scraped, last_seen_at, job_key, manual_edited, manual_edited_at, manual_edited_by, additional_notes
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         (
                             stored["source"], stored["company"], stored["source_job_id"], stored["title"], stored["url"], stored["apply_url"],
