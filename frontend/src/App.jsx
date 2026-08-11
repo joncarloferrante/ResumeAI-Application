@@ -3370,24 +3370,6 @@ function App() {
           </div>
 
           <div className="job-board-header-actions">
-            {isAdmin && (
-              <form className="job-import-form" onSubmit={handleCareersPageImport}>
-                <label className="audit-filter job-import-field">
-                  <span>Careers Page URL</span>
-                  <input
-                    type="url"
-                    value={ashbyImportUrl}
-                    onChange={(event) => setAshbyImportUrl(event.target.value)}
-                    placeholder="https://jobs.ashbyhq.com/company"
-                    required
-                  />
-                </label>
-                <button className="secondary-button" type="submit" disabled={isImportingAshby}>
-                  {isImportingAshby ? "Importing..." : "Import Careers Page"}
-                </button>
-              </form>
-            )}
-
             <button
               className="primary-button add-user-button"
               type="button"
@@ -3421,6 +3403,37 @@ function App() {
         </div>
 
         {isAdmin && (
+          <section className="surface-block careers-source-block">
+            <div className="surface-header careers-source-header">
+              <div>
+                <h2>Add Careers Source</h2>
+                <p className="subtitle">Import jobs automatically from a company&apos;s careers page.</p>
+              </div>
+            </div>
+
+            <form className="careers-source-form" onSubmit={handleCareersPageImport}>
+              <label className="audit-filter careers-source-field">
+                <span>Careers Page URL</span>
+                <input
+                  type="url"
+                  value={ashbyImportUrl}
+                  onChange={(event) => setAshbyImportUrl(event.target.value)}
+                  placeholder="https://company.com/careers"
+                  required
+                />
+              </label>
+
+              <div className="careers-source-actions">
+                <button className="secondary-button" type="submit" disabled={isImportingAshby}>
+                  {isImportingAshby ? "Importing..." : "Import Jobs"}
+                </button>
+                <p className="careers-source-support">Supports Ashby, Greenhouse, and Lever</p>
+              </div>
+            </form>
+          </section>
+        )}
+
+        {isAdmin && (
           <section className="surface-block">
             <div className="surface-header">
               <div>
@@ -3428,52 +3441,56 @@ function App() {
                 <p className="subtitle">Imported sources can be synced again or disabled without deleting jobs.</p>
               </div>
             </div>
-            <div className="table-shell job-table-shell">
-              <table className="data-table job-table">
-                <thead>
-                  <tr>
-                    <th>Company</th>
-                    <th>ATS</th>
-                    <th>Careers URL</th>
-                    <th>Enabled</th>
-                    <th>Last Sync</th>
-                    <th>Status</th>
-                    <th>Jobs Seen</th>
-                    <th>Actions</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {savedJobSources.length === 0 ? (
-                    <tr>
-                      <td className="empty-state" colSpan="8">
-                        No saved ATS sources yet.
-                      </td>
-                    </tr>
-                  ) : (
-                    savedJobSources.map((source) => (
-                      <tr key={source.id}>
-                        <td><TableValue value={source.company_name} /></td>
-                        <td><TableValue value={source.source_type} /></td>
-                        <td><TableValue value={source.careers_url} /></td>
-                        <td>{source.enabled ? "Yes" : "No"}</td>
-                        <td><TableValue value={source.last_sync_at || "Never"} /></td>
-                        <td><TableValue value={source.last_sync_status || "Never"} /></td>
-                        <td>{formatMetric(source.last_sync_job_count)}</td>
-                        <td>
-                          <div className="inline-actions">
-                            <button className="view-button" type="button" onClick={() => handleSyncSource(source.id)} disabled={!source.enabled}>
-                              Sync
-                            </button>
-                            <button className="secondary-button" type="button" onClick={() => handleDisableSource(source.id)} disabled={!source.enabled}>
-                              Disable
-                            </button>
-                          </div>
-                        </td>
-                      </tr>
-                    ))
-                  )}
-                </tbody>
-              </table>
+            <div className="saved-sources-list">
+              {savedJobSources.length === 0 ? (
+                <div className="empty-state saved-sources-empty">No saved ATS sources yet.</div>
+              ) : (
+                savedJobSources.map((source) => (
+                  <article key={source.id} className={`saved-source-card ${source.enabled ? "" : "is-disabled"}`}>
+                    <div className="saved-source-main">
+                      <div>
+                        <div className="saved-source-title-row">
+                          <h3>{formatDetailValue(source.company_name, "Unnamed company")}</h3>
+                          <span className={`status-pill ${source.enabled ? "status-pill--success" : "status-pill--muted"}`}>
+                            {source.enabled ? "Enabled" : "Disabled"}
+                          </span>
+                        </div>
+                        <p className="saved-source-provider">
+                          {formatDetailValue(source.source_type, "Unknown ATS")} · {formatDetailValue(source.source_slug, "No slug")}
+                        </p>
+                      </div>
+
+                      <p className="saved-source-url">{formatDetailValue(source.careers_url, "No careers URL saved")}</p>
+                    </div>
+
+                    <div className="saved-source-meta">
+                      <div>
+                        <span>Last Sync</span>
+                        <strong>{formatDate(source.last_sync_at)}</strong>
+                      </div>
+                      <div>
+                        <span>Status</span>
+                        <strong>{formatDetailValue(source.last_sync_status, "Never synced")}</strong>
+                      </div>
+                      <div>
+                        <span>Jobs Seen</span>
+                        <strong>{formatMetric(source.last_sync_job_count)}</strong>
+                      </div>
+                    </div>
+
+                    {source.last_sync_error ? <p className="saved-source-error">{source.last_sync_error}</p> : null}
+
+                    <div className="saved-source-actions">
+                      <button className="view-button" type="button" onClick={() => handleSyncSource(source.id)} disabled={!source.enabled}>
+                        Sync
+                      </button>
+                      <button className="secondary-button" type="button" onClick={() => handleDisableSource(source.id)} disabled={!source.enabled}>
+                        Disable
+                      </button>
+                    </div>
+                  </article>
+                ))
+              )}
             </div>
           </section>
         )}
