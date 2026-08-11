@@ -188,6 +188,10 @@ function inferSourceFromUrl(url) {
     return "Blair & Potts";
   }
 
+  if (hostname.includes("ashbyhq.com")) {
+    return "Ashby";
+  }
+
   return "";
 }
 
@@ -939,6 +943,7 @@ function App() {
   const [isLoadingAnalytics, setIsLoadingAnalytics] = useState(false);
   const [analyticsError, setAnalyticsError] = useState("");
   const [jobBoard, setJobBoard] = useState(emptyJobBoard);
+  const [savedJobSources, setSavedJobSources] = useState([]);
   const [isLoadingJobs, setIsLoadingJobs] = useState(false);
   const [jobBoardError, setJobBoardError] = useState("");
   const [jobFilters, setJobFilters] = useState({
@@ -968,6 +973,10 @@ function App() {
   const [jobForm, setJobForm] = useState(emptyJobForm);
   const [isSavingJob, setIsSavingJob] = useState(false);
   const [jobActionMessage, setJobActionMessage] = useState("");
+  const [ashbyImportUrl, setAshbyImportUrl] = useState("");
+  const [isImportingAshby, setIsImportingAshby] = useState(false);
+  const [ashbyImportMessage, setAshbyImportMessage] = useState("");
+  const [sourceActionMessage, setSourceActionMessage] = useState("");
   const [isEditingJob, setIsEditingJob] = useState(false);
   const [isSavingEditedJob, setIsSavingEditedJob] = useState(false);
   const [jobEditMessage, setJobEditMessage] = useState("");
@@ -1619,6 +1628,24 @@ function App() {
     }
   }, []);
 
+  const loadJobSources = useCallback(async () => {
+    if (!isAdmin) {
+      return false;
+    }
+
+    try {
+      const response = await api.get("/api/admin/job-sources");
+      setSavedJobSources(response.data || []);
+      return true;
+    } catch (error) {
+      console.error(error);
+      if (error.response?.status !== 401) {
+        setSourceActionMessage("Could not load saved ATS sources.");
+      }
+      return false;
+    }
+  }, [isAdmin]);
+
   const loadJobMatches = useCallback(async (job, refresh = false) => {
     if (!job) {
       return false;
@@ -1790,12 +1817,16 @@ function App() {
   useEffect(() => {
     if (user) {
       loadCandidates();
+      if (user.role === "admin") {
+        loadJobSources();
+      }
     } else {
       setCandidates([]);
       setSelectedCandidate(null);
       setAuditLogs([]);
       setAnalytics(emptyAnalytics);
       setJobBoard(emptyJobBoard);
+      setSavedJobSources([]);
       setSelectedJob(null);
       setJobMatches([]);
       setActivePage("candidates");
@@ -1820,6 +1851,9 @@ function App() {
   useEffect(() => {
     if (safeActivePage === "jobBoard" && user) {
       loadJobs();
+      if (user.role === "admin") {
+        loadJobSources();
+      }
     }
   }, [loadJobs, safeActivePage, user]);
 
@@ -2159,6 +2193,55 @@ function App() {
       }
     } finally {
       setIsSavingJob(false);
+    }
+  };
+
+  const handleAshbyImport = async (event) => {
+    event.preventDefault();
+    setIsImportingAshby(true);
+    setAshbyImportMessage("");
+
+    try {
+      const response = await api.post("/api/admin/ats/import", { careers_url: ashbyImportUrl.trim() });
+      const result = response.data || {};
+      setAshbyImportMessage(
+        `Saved source and imported ${formatMetric(result.result?.jobs_added)} added, ${formatMetric(result.result?.jobs_updated)} updated, ${formatMetric(result.result?.jobs_skipped)} skipped, ${formatMetric(result.result?.jobs_failed)} failed.`,
+      );
+      setAshbyImportUrl("");
+      await loadJobs();
+      await loadJobSources();
+    } catch (error) {
+      console.error(error);
+      const detail = error.response?.data?.detail;
+      setAshbyImportMessage(detail || "Could not import Ashby jobs.");
+    } finally {
+      setIsImportingAshby(false);
+    }
+  };
+
+  const handleSyncSource = async (sourceId) => {
+    setSourceActionMessage("");
+    try {
+      await api.post(`/api/admin/job-sources/${sourceId}/sync`);
+      await Promise.all([loadJobs(), loadJobSources()]);
+      setSourceActionMessage("Source synced successfully.");
+    } catch (error) {
+      console.error(error);
+      const detail = error.response?.data?.detail;
+      setSourceActionMessage(detail || "Could not sync source.");
+    }
+  };
+
+  const handleDisableSource = async (sourceId) => {
+    setSourceActionMessage("");
+    try {
+      await api.patch(`/api/admin/job-sources/${sourceId}/disable`);
+      await loadJobSources();
+      setSourceActionMessage("Source disabled.");
+    } catch (error) {
+      console.error(error);
+      const detail = error.response?.data?.detail;
+      setSourceActionMessage(detail || "Could not disable source.");
     }
   };
 
@@ -3270,20 +3353,42 @@ function App() {
             <p className="subtitle">Track requisitions, candidate matches, and hiring pipeline coverage.</p>
           </div>
 
-          <button
-            className="primary-button add-user-button"
-            type="button"
-            onClick={() => {
-              setJobForm(emptyJobForm);
-              setJobActionMessage("");
-              setIsJobModalOpen(true);
-            }}
-          >
-            Create Job Requisition
-          </button>
+          <div className="job-board-header-actions">
+            {isAdmin && (
+              <form className="job-import-form" onSubmit={handleAshbyImport}>
+                <label className="audit-filter job-import-field">
+                  <span>Ashby careers URL</span>
+                  <input
+                    type="url"
+                    value={ashbyImportUrl}
+                    onChange={(event) => setAshbyImportUrl(event.target.value)}
+                    placeholder="https://jobs.ashbyhq.com/company"
+                    required
+                  />
+                </label>
+                <button className="secondary-button" type="submit" disabled={isImportingAshby}>
+                  {isImportingAshby ? "Importing..." : "Import Ashby Jobs"}
+                </button>
+              </form>
+            )}
+
+            <button
+              className="primary-button add-user-button"
+              type="button"
+              onClick={() => {
+                setJobForm(emptyJobForm);
+                setJobActionMessage("");
+                setIsJobModalOpen(true);
+              }}
+            >
+              Create Job Requisition
+            </button>
+          </div>
         </header>
 
         {jobBoardError && <p className="error-message">{jobBoardError}</p>}
+        {ashbyImportMessage && <p className="success-message">{ashbyImportMessage}</p>}
+        {sourceActionMessage && <p className="success-message">{sourceActionMessage}</p>}
         {isJobMatching && selectedJob && (
           <div className="job-match-banner" role="status" aria-live="polite">
             <SpinnerIcon />
@@ -3298,6 +3403,64 @@ function App() {
             <MetricCard key={card.label} {...card} />
           ))}
         </div>
+
+        {isAdmin && (
+          <section className="surface-block">
+            <div className="surface-header">
+              <div>
+                <h2>Saved ATS Sources</h2>
+                <p className="subtitle">Imported sources can be synced again or disabled without deleting jobs.</p>
+              </div>
+            </div>
+            <div className="table-shell job-table-shell">
+              <table className="data-table job-table">
+                <thead>
+                  <tr>
+                    <th>Company</th>
+                    <th>ATS</th>
+                    <th>Careers URL</th>
+                    <th>Enabled</th>
+                    <th>Last Sync</th>
+                    <th>Status</th>
+                    <th>Jobs Seen</th>
+                    <th>Actions</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {savedJobSources.length === 0 ? (
+                    <tr>
+                      <td className="empty-state" colSpan="8">
+                        No saved ATS sources yet.
+                      </td>
+                    </tr>
+                  ) : (
+                    savedJobSources.map((source) => (
+                      <tr key={source.id}>
+                        <td><TableValue value={source.company_name} /></td>
+                        <td><TableValue value={source.source_type} /></td>
+                        <td><TableValue value={source.careers_url} /></td>
+                        <td>{source.enabled ? "Yes" : "No"}</td>
+                        <td><TableValue value={source.last_sync_at || "Never"} /></td>
+                        <td><TableValue value={source.last_sync_status || "Never"} /></td>
+                        <td>{formatMetric(source.last_sync_job_count)}</td>
+                        <td>
+                          <div className="inline-actions">
+                            <button className="view-button" type="button" onClick={() => handleSyncSource(source.id)} disabled={!source.enabled}>
+                              Sync
+                            </button>
+                            <button className="secondary-button" type="button" onClick={() => handleDisableSource(source.id)} disabled={!source.enabled}>
+                              Disable
+                            </button>
+                          </div>
+                        </td>
+                      </tr>
+                    ))
+                  )}
+                </tbody>
+              </table>
+            </div>
+          </section>
+        )}
 
         <section className="surface-block job-filter-panel">
           <div className="job-filters">
@@ -3318,7 +3481,7 @@ function App() {
               <span>Source</span>
               <select value={jobFilters.source} onChange={(event) => updateJobFilter("source", event.target.value)}>
                 <option>All Sources</option>
-                {jobSources.map((source) => (
+                {savedJobSources.map((source) => (
                   <option key={source}>{source}</option>
                 ))}
               </select>

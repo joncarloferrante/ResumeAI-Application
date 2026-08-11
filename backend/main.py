@@ -69,6 +69,9 @@ from .database import (
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from .logging_config import configure_logging, get_logger
+from .ats.service import register_or_update_job_source, sync_job_source
+from .database import get_job_sources, set_job_source_disabled
+from .ats.registry import detect_adapter
 
 configure_logging()
 logger = get_logger("main")
@@ -183,6 +186,14 @@ class ScrapedJobUpdatePayload(BaseModel):
     benefits: str | None = None
     additional_notes: str | None = None
     active: bool | None = None
+
+
+class AtsImportPayload(BaseModel):
+    careers_url: str
+
+
+class JobSourceActionPayload(BaseModel):
+    source_id: int
 
 
 def normalize_email(email: str) -> str:
@@ -806,6 +817,50 @@ def list_audit_logs(current_user: dict = Depends(get_current_user)):
 @app.get("/api/scraped-jobs")
 def list_scraped_jobs():
     return get_scraped_jobs()
+
+
+@app.get("/api/admin/job-sources")
+def list_job_sources(current_user: dict = Depends(require_admin)):
+    return get_job_sources()
+
+
+@app.post("/api/admin/ats/import")
+def import_ats_jobs(payload: AtsImportPayload, current_user: dict = Depends(require_admin)):
+    source = register_or_update_job_source(payload.careers_url)
+    result = sync_job_source(int(source["id"]))
+    create_audit_log(
+        current_user["email"],
+        "ATS Import",
+        {
+            "source_id": source["id"],
+            "careers_url": source["careers_url"],
+            "source_type": source["source_type"],
+            "company_name": source["company_name"],
+            "jobs_found": result["jobs_found"],
+            "jobs_added": result["jobs_added"],
+            "jobs_updated": result["jobs_updated"],
+            "jobs_skipped": result["jobs_skipped"],
+            "jobs_failed": result["jobs_failed"],
+        },
+        "success" if result["jobs_failed"] == 0 else "warning",
+    )
+    return {"source": source, "result": result}
+
+
+@app.post("/api/admin/job-sources/{source_id}/sync")
+def sync_saved_job_source(source_id: int, current_user: dict = Depends(require_admin)):
+    result = sync_job_source(source_id)
+    create_audit_log(current_user["email"], "ATS Sync", result, "success" if result["jobs_failed"] == 0 else "warning")
+    return result
+
+
+@app.patch("/api/admin/job-sources/{source_id}/disable")
+def disable_saved_job_source(source_id: int, current_user: dict = Depends(require_admin)):
+    source = set_job_source_disabled(source_id, True)
+    if not source:
+        raise HTTPException(status_code=404, detail="Source not found")
+    create_audit_log(current_user["email"], "ATS Source Disabled", {"source_id": source_id}, "success")
+    return source
 
 
 @app.patch("/api/scraped-jobs/{job_id}")

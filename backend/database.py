@@ -75,6 +75,7 @@ SCRAPED_JOBS_TABLE_SQL = """
         last_scraped TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         source TEXT,
         company TEXT,
+        source_slug TEXT,
         responsibilities TEXT,
         qualifications TEXT,
         benefits TEXT,
@@ -86,6 +87,23 @@ SCRAPED_JOBS_TABLE_SQL = """
         manual_edited_at TIMESTAMP,
         manual_edited_by TEXT,
         additional_notes TEXT
+    )
+"""
+JOB_SOURCES_TABLE_SQL = """
+    CREATE TABLE IF NOT EXISTS job_sources (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        company_name TEXT NOT NULL,
+        source_type TEXT NOT NULL,
+        careers_url TEXT NOT NULL UNIQUE,
+        source_slug TEXT,
+        enabled INTEGER NOT NULL DEFAULT 1,
+        last_sync_at TIMESTAMP,
+        last_successful_sync_at TIMESTAMP,
+        last_sync_status TEXT,
+        last_sync_error TEXT,
+        last_sync_job_count INTEGER NOT NULL DEFAULT 0,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )
 """
 
@@ -675,6 +693,7 @@ def init_db():
         cursor.execute("ALTER TABLE match_cache ADD COLUMN is_stale INTEGER NOT NULL DEFAULT 0")
 
     cursor.execute(SCRAPED_JOBS_TABLE_SQL)
+    cursor.execute(JOB_SOURCES_TABLE_SQL)
     scraped_job_columns = _fetch_table_columns(conn, "scraped_jobs")
     for column_name, column_definition in {
         "job_key": "TEXT",
@@ -682,11 +701,13 @@ def init_db():
         "apply_url": "TEXT",
         "workplace_type": "TEXT",
         "posted_date": "TEXT",
+        "last_seen_at": "TIMESTAMP",
         "manual_edited": "INTEGER NOT NULL DEFAULT 0",
         "manual_edited_at": "TIMESTAMP",
         "manual_edited_by": "TEXT",
         "source": "TEXT",
         "company": "TEXT",
+        "source_slug": "TEXT",
         "responsibilities": "TEXT",
         "qualifications": "TEXT",
         "benefits": "TEXT",
@@ -698,6 +719,26 @@ def init_db():
                 cursor.execute(f"ALTER TABLE scraped_jobs ADD COLUMN IF NOT EXISTS {column_name} {column_definition}")
             else:
                 cursor.execute(f"ALTER TABLE scraped_jobs ADD COLUMN {column_name} {column_definition}")
+
+    source_columns = _fetch_table_columns(conn, "job_sources")
+    for column_name, column_definition in {
+        "company_name": "TEXT NOT NULL DEFAULT ''",
+        "source_type": "TEXT NOT NULL DEFAULT ''",
+        "careers_url": "TEXT NOT NULL DEFAULT ''",
+        "source_slug": "TEXT",
+        "enabled": "INTEGER NOT NULL DEFAULT 1",
+        "last_sync_at": "TIMESTAMP",
+        "last_successful_sync_at": "TIMESTAMP",
+        "last_sync_status": "TEXT",
+        "last_sync_error": "TEXT",
+        "last_sync_job_count": "INTEGER NOT NULL DEFAULT 0",
+        "updated_at": "TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
+    }.items():
+        if column_name not in source_columns:
+            if USING_POSTGRES:
+                cursor.execute(f"ALTER TABLE job_sources ADD COLUMN IF NOT EXISTS {column_name} {column_definition}")
+            else:
+                cursor.execute(f"ALTER TABLE job_sources ADD COLUMN {column_name} {column_definition}")
 
     conn.commit()
     conn.close()
@@ -2313,6 +2354,7 @@ def get_scraped_jobs():
             last_scraped,
             source,
             company,
+            last_seen_at,
             responsibilities,
             qualifications,
             benefits,
@@ -2383,6 +2425,138 @@ def get_scraped_jobs():
         75,
     )
     return {"jobs": jobs, "summary": summary}
+
+
+def get_job_sources():
+    conn = get_connection()
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT *
+        FROM job_sources
+        ORDER BY id DESC
+    """)
+    rows = [dict(row) for row in cursor.fetchall()]
+    conn.close()
+    return rows
+
+
+def get_job_source_by_id(source_id: int):
+    conn = get_connection()
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM job_sources WHERE id = ?", (source_id,))
+    row = cursor.fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def save_job_source(payload: dict) -> dict:
+    conn = get_connection()
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT *
+        FROM job_sources
+        WHERE careers_url = ?
+    """, (payload["careers_url"],))
+    existing = cursor.fetchone()
+    if existing:
+        cursor.execute("""
+            UPDATE job_sources
+            SET company_name = ?,
+                source_type = ?,
+                source_slug = ?,
+                enabled = COALESCE(?, enabled),
+                updated_at = CURRENT_TIMESTAMP
+            WHERE careers_url = ?
+        """, (
+            payload.get("company_name", existing["company_name"]),
+            payload.get("source_type", existing["source_type"]),
+            payload.get("source_slug", existing["source_slug"]),
+            payload.get("enabled", existing["enabled"]),
+            payload["careers_url"],
+        ))
+    else:
+        cursor.execute("""
+            INSERT INTO job_sources (
+                company_name,
+                source_type,
+                careers_url,
+                source_slug,
+                enabled,
+                last_sync_at,
+                last_successful_sync_at,
+                last_sync_status,
+                last_sync_error,
+                last_sync_job_count,
+                created_at,
+                updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, 0, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+        """, (
+            payload["company_name"],
+            payload["source_type"],
+            payload["careers_url"],
+            payload.get("source_slug", ""),
+            int(payload.get("enabled", 1)),
+        ))
+    conn.commit()
+    cursor.execute("SELECT * FROM job_sources WHERE careers_url = ?", (payload["careers_url"],))
+    row = cursor.fetchone()
+    conn.close()
+    return dict(row) if row else {}
+
+
+def update_job_source_sync_result(source_id: int, payload: dict) -> dict | None:
+    conn = get_connection()
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM job_sources WHERE id = ?", (source_id,))
+    existing = cursor.fetchone()
+    if not existing:
+        conn.close()
+        return None
+
+    cursor.execute("""
+        UPDATE job_sources
+        SET last_sync_at = COALESCE(?, last_sync_at),
+            last_successful_sync_at = COALESCE(?, last_successful_sync_at),
+            last_sync_status = COALESCE(?, last_sync_status),
+            last_sync_error = COALESCE(?, last_sync_error),
+            last_sync_job_count = COALESCE(?, last_sync_job_count),
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = ?
+    """, (
+        payload.get("last_sync_at"),
+        payload.get("last_successful_sync_at"),
+        payload.get("last_sync_status"),
+        payload.get("last_sync_error"),
+        payload.get("last_sync_job_count"),
+        source_id,
+    ))
+    conn.commit()
+    cursor.execute("SELECT * FROM job_sources WHERE id = ?", (source_id,))
+    row = cursor.fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def set_job_source_disabled(source_id: int, disabled: bool = True) -> dict | None:
+    conn = get_connection()
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+    cursor.execute("""
+        UPDATE job_sources
+        SET enabled = ?,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = ?
+    """, (0 if disabled else 1, source_id))
+    conn.commit()
+    cursor.execute("SELECT * FROM job_sources WHERE id = ?", (source_id,))
+    row = cursor.fetchone()
+    conn.close()
+    return dict(row) if row else None
 
 
 def get_scraped_job_by_id(job_identifier: int | str):
