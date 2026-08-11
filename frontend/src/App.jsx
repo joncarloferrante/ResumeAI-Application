@@ -1635,7 +1635,12 @@ function App() {
 
     try {
       const response = await api.get("/api/admin/job-sources");
-      setSavedJobSources(response.data || []);
+      const nextSources = Array.isArray(response.data)
+        ? response.data
+        : Array.isArray(response.data?.sources)
+          ? response.data.sources
+          : [];
+      setSavedJobSources(nextSources);
       return true;
     } catch (error) {
       console.error(error);
@@ -3482,7 +3487,9 @@ function App() {
               <select value={jobFilters.source} onChange={(event) => updateJobFilter("source", event.target.value)}>
                 <option>All Sources</option>
                 {savedJobSources.map((source) => (
-                  <option key={source}>{source}</option>
+                  <option key={source.id} value={source.source_type || source.company_name || source.id}>
+                    {source.source_type || source.company_name || "Saved Source"}
+                  </option>
                 ))}
               </select>
             </label>
