@@ -37,9 +37,6 @@ const auditActionOptions = [
 
 const auditStatusOptions = ["All Statuses", "Success", "Failed", "Denied", "Warning"];
 
-const jobStatusOptions = ["open", "paused", "closed", "draft", "offer sent"];
-const jobTypeOptions = ["Full-time", "Contract", "Contract-to-hire", "Part-time", "Temporary"];
-
 const emptyJobBoard = {
   jobs: [],
   summary: {
@@ -1284,8 +1281,22 @@ function App() {
     () => Array.from(new Set(jobs.map((job) => job.location).filter(Boolean))).sort(),
     [jobs],
   );
+  const jobStatuses = useMemo(
+    () =>
+      Array.from(
+        new Set(jobs.map((job) => String(job.status || "").trim().toLowerCase()).filter(Boolean)),
+      ).sort(),
+    [jobs],
+  );
   const availableJobTypes = useMemo(
-    () => Array.from(new Set([...jobTypeOptions, ...jobs.map((job) => job.job_type || job.employment_type).filter(Boolean)])),
+    () =>
+      Array.from(
+        new Set(jobs.map((job) => job.job_type || job.employment_type).filter(Boolean)),
+      ).sort((firstType, secondType) =>
+        String(firstType).localeCompare(String(secondType), undefined, {
+          sensitivity: "base",
+        }),
+      ),
     [jobs],
   );
   const jobsPerPage = 8;
@@ -3486,9 +3497,9 @@ function App() {
               <span>Source</span>
               <select value={jobFilters.source} onChange={(event) => updateJobFilter("source", event.target.value)}>
                 <option>All Sources</option>
-                {savedJobSources.map((source) => (
-                  <option key={source.id} value={source.source_type || source.company_name || source.id}>
-                    {source.source_type || source.company_name || "Saved Source"}
+                {jobSources.map((source) => (
+                  <option key={source} value={source}>
+                    {source}
                   </option>
                 ))}
               </select>
@@ -3527,7 +3538,7 @@ function App() {
                 onChange={(event) => updateJobFilter("status", event.target.value)}
               >
                 <option>All Statuses</option>
-                {jobStatusOptions.map((status) => (
+                {jobStatuses.map((status) => (
                   <option key={status} value={status}>
                     {formatLabel(status)}
                   </option>
@@ -3543,7 +3554,9 @@ function App() {
               >
                 <option>All Types</option>
                 {availableJobTypes.map((jobType) => (
-                  <option key={jobType}>{jobType}</option>
+                  <option key={jobType} value={jobType}>
+                    {jobType}
+                  </option>
                 ))}
               </select>
             </label>
@@ -5076,7 +5089,7 @@ function App() {
                     value={jobForm.job_type}
                     onChange={(event) => setJobForm((currentForm) => ({ ...currentForm, job_type: event.target.value }))}
                   >
-                    {jobTypeOptions.map((jobType) => (
+                    {availableJobTypes.map((jobType) => (
                       <option key={jobType}>{jobType}</option>
                     ))}
                   </select>
@@ -5088,7 +5101,7 @@ function App() {
                     value={jobForm.status}
                     onChange={(event) => setJobForm((currentForm) => ({ ...currentForm, status: event.target.value }))}
                   >
-                    {jobStatusOptions.map((status) => (
+                    {jobStatuses.map((status) => (
                       <option key={status} value={status}>
                         {formatLabel(status)}
                       </option>
