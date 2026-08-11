@@ -95,6 +95,7 @@ JOB_SOURCES_TABLE_SQL = """
         company_name TEXT NOT NULL,
         source_type TEXT NOT NULL,
         careers_url TEXT NOT NULL UNIQUE,
+        original_careers_url TEXT,
         source_slug TEXT,
         enabled INTEGER NOT NULL DEFAULT 1,
         last_sync_at TIMESTAMP,
@@ -155,6 +156,16 @@ def _fetch_table_columns(conn, table_name: str) -> set[str]:
 
     cursor.execute(f"PRAGMA table_info({table_name})")
     return {row[1] for row in cursor.fetchall()}
+
+
+def ensure_job_sources_columns(conn) -> None:
+    columns = _fetch_table_columns(conn, "job_sources")
+    cursor = conn.cursor()
+    if "original_careers_url" not in columns:
+        if USING_POSTGRES:
+            cursor.execute("ALTER TABLE job_sources ADD COLUMN IF NOT EXISTS original_careers_url TEXT")
+        else:
+            cursor.execute("ALTER TABLE job_sources ADD COLUMN original_careers_url TEXT")
 
 
 def _row_value(row, column_name: str, index: int):
@@ -2455,6 +2466,7 @@ def save_job_source(payload: dict) -> dict:
     conn = get_connection()
     conn.row_factory = sqlite3.Row
     cursor = conn.cursor()
+    ensure_job_sources_columns(conn)
     cursor.execute("""
         SELECT *
         FROM job_sources
@@ -2467,6 +2479,7 @@ def save_job_source(payload: dict) -> dict:
             SET company_name = ?,
                 source_type = ?,
                 source_slug = ?,
+                original_careers_url = COALESCE(?, original_careers_url),
                 enabled = COALESCE(?, enabled),
                 updated_at = CURRENT_TIMESTAMP
             WHERE careers_url = ?
@@ -2474,6 +2487,7 @@ def save_job_source(payload: dict) -> dict:
             payload.get("company_name", existing["company_name"]),
             payload.get("source_type", existing["source_type"]),
             payload.get("source_slug", existing["source_slug"]),
+            payload.get("original_careers_url"),
             payload.get("enabled", existing["enabled"]),
             payload["careers_url"],
         ))
@@ -2483,6 +2497,7 @@ def save_job_source(payload: dict) -> dict:
                 company_name,
                 source_type,
                 careers_url,
+                original_careers_url,
                 source_slug,
                 enabled,
                 last_sync_at,
@@ -2493,11 +2508,12 @@ def save_job_source(payload: dict) -> dict:
                 created_at,
                 updated_at
             )
-            VALUES (?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, 0, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+            VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, 0, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
         """, (
             payload["company_name"],
             payload["source_type"],
             payload["careers_url"],
+            payload.get("original_careers_url"),
             payload.get("source_slug", ""),
             int(payload.get("enabled", 1)),
         ))

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
+from .discovery import discover_supported_ats_url
 from .registry import detect_adapter
 from ..database import (
     get_job_sources,
@@ -53,17 +54,19 @@ def _mark_missing_jobs_inactive(source: dict, seen_job_keys: set[str]) -> int:
 
 
 def register_or_update_job_source(careers_url: str) -> dict:
-    adapter = detect_adapter(careers_url)
+    discovered_url = discover_supported_ats_url(careers_url)
+    adapter = detect_adapter(discovered_url)
     if not adapter:
         raise ValueError("This careers platform is not supported yet.")
 
-    normalized_url = adapter.normalize_careers_url(careers_url)
+    normalized_url = adapter.normalize_careers_url(discovered_url)
     company_slug = adapter.extract_company_slug(normalized_url)
     source = save_job_source(
         {
             "company_name": company_slug,
             "source_type": adapter.source_name,
             "careers_url": normalized_url,
+            "original_careers_url": careers_url.strip(),
             "source_slug": company_slug,
             "enabled": 1,
         }
