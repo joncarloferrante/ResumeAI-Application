@@ -5,6 +5,10 @@ from .full_resume_parser import parse_resume, create_lmstudio_client, DEFAULT_MO
 
 
 def parse_resume_file(path: Path) -> dict:
+    return parse_resume_file_with_text(path)
+
+
+def parse_resume_file_with_text(path: Path, raw_text: str | None = None) -> dict:
     today = datetime.today().date()
 
     try:
@@ -21,4 +25,5 @@ def parse_resume_file(path: Path) -> dict:
         model=DEFAULT_MODEL,
         use_llm=client is not None,
         allow_regex_fallback=False,
+        raw_text=raw_text,
     )

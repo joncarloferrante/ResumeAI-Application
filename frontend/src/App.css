@@ -1253,7 +1253,7 @@ tbody tr:hover .actions-column {
 
 .upload-file-panel {
   display: grid;
-  gap: 12px;
+  gap: 10px;
   min-width: 0;
   padding: 14px;
   border: 1px solid var(--border);
@@ -1472,6 +1472,161 @@ tbody tr:hover .actions-column {
   display: flex;
   justify-content: flex-end;
   gap: 10px;
+}
+
+.upload-process-card {
+  display: grid;
+  gap: 12px;
+  padding: 14px 16px;
+  border-color: #d9e4f7;
+  background: linear-gradient(180deg, #fbfdff 0%, #f5f9ff 100%);
+}
+
+.upload-process-card .detail-card-header {
+  gap: 8px;
+}
+
+.upload-process-card .detail-card-header p {
+  color: var(--text);
+  font-size: 12.5px;
+  line-height: 1.45;
+}
+
+.upload-process-steps {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 10px;
+  align-items: start;
+}
+
+.upload-process-step {
+  display: grid;
+  justify-items: center;
+  gap: 8px;
+  text-align: center;
+  min-width: 0;
+}
+
+.upload-process-step strong {
+  color: var(--text-strong);
+  font-size: 12px;
+  line-height: 1.35;
+}
+
+.upload-process-step-icon {
+  display: grid;
+  place-items: center;
+  width: 34px;
+  height: 34px;
+  border: 1px solid #d6e1f0;
+  border-radius: 999px;
+  background: #ffffff;
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.upload-process-step-icon.is-complete {
+  border-color: #c8d9ff;
+  background: linear-gradient(135deg, #2f6df4 0%, #1f5ee6 100%);
+  color: #ffffff;
+  box-shadow: 0 6px 16px rgba(47, 109, 244, 0.18);
+}
+
+.upload-process-card .status-message {
+  margin-top: 2px;
+  padding: 10px 12px;
+  border: 1px solid #d9e6fb;
+  border-radius: 10px;
+  background: #f8fbff;
+}
+
+.recent-table {
+  width: 100%;
+}
+
+.recent-table th {
+  white-space: nowrap;
+}
+
+.recent-table td {
+  vertical-align: top;
+}
+
+.recent-table .table-subtext {
+  display: block;
+  margin-top: 4px;
+  color: var(--text);
+  font-size: 12px;
+  line-height: 1.35;
+}
+
+.recent-table .status-pill {
+  margin-bottom: 4px;
+}
+
+.status-pill.status-success,
+.status-pill.status-warning,
+.status-pill.status-danger,
+.status-pill.status-neutral,
+.status-pill.status-failed,
+.status-pill.status-muted,
+.status-pill.status-processing,
+.status-pill.status-rejected {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 28px;
+  padding: 0 10px;
+  border-width: 1px;
+  border-style: solid;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.01em;
+  white-space: nowrap;
+}
+
+.status-pill.status-success {
+  border-color: #b9e4c5;
+  background: #f0fbf4;
+  color: #15803d;
+}
+
+.status-pill.status-warning,
+.status-pill.status-neutral {
+  border-color: #d7e3f4;
+  background: #f6f9ff;
+  color: #35527d;
+}
+
+.status-pill.status-danger,
+.status-pill.status-failed,
+.status-pill.status-rejected {
+  border-color: #fecdd3;
+  background: #fff1f2;
+  color: #b42318;
+}
+
+.status-pill.status-muted,
+.status-pill.status-processing {
+  border-color: #d9e4f7;
+  background: #f8fbff;
+  color: #40628c;
+}
+
+.recent-table .view-button,
+.recent-table .secondary-button {
+  min-height: 34px;
+  padding-inline: 12px;
+}
+
+.recent-table .view-button {
+  min-width: 110px;
+}
+
+.upload-file-panel-header strong {
+  font-size: 13px;
 }
 
 .placeholder-block {
@@ -3519,6 +3674,20 @@ tbody tr:hover .actions-column {
   .upload-action-buttons .secondary-button {
     width: 100%;
   }
+
+  .upload-process-steps {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .upload-process-step {
+    justify-items: start;
+    text-align: left;
+  }
+
+  .upload-process-step-icon {
+    width: 32px;
+    height: 32px;
+  }
 }
 
 @media (max-width: 720px) {
@@ -3552,6 +3721,35 @@ tbody tr:hover .actions-column {
 
   .upload-dropzone-copy h2 {
     font-size: 20px;
+  }
+
+  .upload-process-card {
+    padding: 12px;
+  }
+
+  .upload-process-steps {
+    grid-template-columns: 1fr;
+    gap: 8px;
+  }
+
+  .upload-process-step {
+    grid-template-columns: auto 1fr;
+    align-items: center;
+    gap: 10px;
+  }
+
+  .upload-process-step strong {
+    text-align: left;
+  }
+
+  .recent-table {
+    min-width: 640px;
+  }
+
+  .recent-table .view-button,
+  .recent-table .secondary-button {
+    width: 100%;
+    justify-content: center;
   }
 
   .candidate-table-shell,

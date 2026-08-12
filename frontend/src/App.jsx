@@ -100,6 +100,55 @@ const missingValueTokens = new Set([
   "company unknown",
 ]);
 
+const uploadPipelineSteps = [
+  "Security Check",
+  "Extract Text / OCR",
+  "Validate Resume",
+  "Parse Candidate",
+  "Ready for Matching",
+];
+
+function formatUploadStatus(upload) {
+  const status = String(upload?.status || "").toLowerCase();
+  if (status === "ready") {
+    return { label: "Ready", tone: "success", message: "Resume processed successfully and is ready for matching." };
+  }
+  if (status === "uploaded" || status === "security_check" || status === "extracting_text" || status === "ocr_processing" || status === "validating" || status === "parsing") {
+    return { label: "Processing", tone: "warning", message: "Your resume is being processed." };
+  }
+  if (status === "needs_review") {
+    return { label: "Needs Review", tone: "warning", message: "We couldn't confidently read this resume automatically. It has been marked for review." };
+  }
+  if (status === "unreadable") {
+    return { label: "Unreadable", tone: "danger", message: "We couldn't extract enough readable information from this document." };
+  }
+  if (status === "rejected") {
+    return { label: "Rejected", tone: "danger", message: "This document does not appear to be a resume." };
+  }
+  if (status === "failed") {
+    return { label: "Failed", tone: "danger", message: "We couldn't finish processing this resume. Please try again." };
+  }
+  if (status === "security_blocked") {
+    return { label: "Security Blocked", tone: "danger", message: "This file could not be processed because it did not pass upload validation." };
+  }
+  return { label: "Processing", tone: "warning", message: "Your resume is being processed." };
+}
+
+function formatUploadStageLabel(upload) {
+  const stage = String(upload?.processing_stage || upload?.status || "").toLowerCase();
+  if (stage === "security_check") return "Security check";
+  if (stage === "extracting_text") return "Extracting text";
+  if (stage === "ocr_processing") return "OCR processing";
+  if (stage === "validating") return "Validating resume";
+  if (stage === "parsing") return "Parsing candidate";
+  if (stage === "ready") return "Ready for matching";
+  if (stage === "needs_review") return "Needs review";
+  if (stage === "unreadable") return "Unreadable";
+  if (stage === "rejected") return "Rejected";
+  if (stage === "failed") return "Failed";
+  return "Processing";
+}
+
 const recruiterNavigationItems = [
   { key: "candidates", label: "Candidates", icon: CandidatesIcon },
   { key: "upload", label: "Upload Resume", icon: UploadIcon },
@@ -1214,10 +1263,10 @@ function App() {
   const [isSubmittingAuth, setIsSubmittingAuth] = useState(false);
   const [files, setFiles] = useState([]);
   const [message, setMessage] = useState("");
+  const [uploadRecords, setUploadRecords] = useState([]);
+  const [isLoadingUploadRecords, setIsLoadingUploadRecords] = useState(false);
   const [candidates, setCandidates] = useState([]);
   const [isUploading, setIsUploading] = useState(false);
-  const [uploadProgress, setUploadProgress] = useState(0);
-  const [uploadStatus, setUploadStatus] = useState("idle");
   const [uploadError, setUploadError] = useState("");
   const [isLoadingCandidates, setIsLoadingCandidates] = useState(false);
   const [candidateError, setCandidateError] = useState("");
@@ -1329,7 +1378,6 @@ function App() {
   const [lastCandidatesRefresh, setLastCandidatesRefresh] = useState(null);
   const [isDraggingUpload, setIsDraggingUpload] = useState(false);
   const uploadInputRef = useRef(null);
-  const uploadProgressTimerRef = useRef(null);
   const jobMatchRequestRef = useRef(0);
   const activeJobIdRef = useRef(null);
   const jobMatchInProgressRef = useRef(false);
@@ -1345,48 +1393,6 @@ function App() {
   );
   const candidatesPerPage = 10;
   const safeActivePage = allowedPages.has(activePage) ? activePage : "candidates";
-
-  const stopUploadProgressSimulation = useCallback(() => {
-    if (uploadProgressTimerRef.current) {
-      window.clearInterval(uploadProgressTimerRef.current);
-      uploadProgressTimerRef.current = null;
-    }
-  }, [isEditingJob, isSavingEditedJob]);
-
-  const beginUploadProgressSimulation = useCallback(() => {
-    stopUploadProgressSimulation();
-    setUploadStatus("uploading");
-    setUploadError("");
-    setUploadProgress(6);
-
-    uploadProgressTimerRef.current = window.setInterval(() => {
-      setUploadProgress((currentProgress) => {
-        if (currentProgress >= 90) {
-          return 90;
-        }
-
-        const remainingProgress = 90 - currentProgress;
-        const nextStep = Math.max(0.5, Math.min(7, remainingProgress * 0.16));
-        return Math.min(90, currentProgress + nextStep);
-      });
-    }, 320);
-  }, [stopUploadProgressSimulation]);
-
-  const completeUploadProgress = useCallback(() => {
-    stopUploadProgressSimulation();
-    setUploadProgress(100);
-    setUploadStatus("success");
-    setUploadError("");
-  }, [stopUploadProgressSimulation]);
-
-  const failUploadProgress = useCallback(
-    (errorMessage) => {
-      stopUploadProgressSimulation();
-      setUploadStatus("error");
-      setUploadError(errorMessage);
-    },
-    [stopUploadProgressSimulation],
-  );
 
   const visibleCandidates = useMemo(() => {
     const normalizedQuery = searchQuery.trim().toLowerCase();
@@ -2197,6 +2203,25 @@ function App() {
     }
   }, []);
 
+  const loadResumeUploads = useCallback(async () => {
+    if (!user) {
+      return false;
+    }
+
+    setIsLoadingUploadRecords(true);
+
+    try {
+      const response = await api.get("/resume-uploads");
+      setUploadRecords(Array.isArray(response.data?.uploads) ? response.data.uploads : []);
+      return true;
+    } catch (error) {
+      console.error(error);
+      return false;
+    } finally {
+      setIsLoadingUploadRecords(false);
+    }
+  }, [user]);
+
   useEffect(() => {
     const checkAuth = async () => {
       try {
@@ -2215,11 +2240,13 @@ function App() {
   useEffect(() => {
     if (user) {
       loadCandidates();
+      loadResumeUploads();
       if (user.role === "admin") {
         loadJobSources();
       }
     } else {
       setCandidates([]);
+      setUploadRecords([]);
       setSelectedCandidate(null);
       setAuditLogs([]);
       setAnalytics(emptyAnalytics);
@@ -2232,7 +2259,7 @@ function App() {
       setLastUsersRefresh(null);
       setLastSecurityRefresh(null);
     }
-  }, [user, loadCandidates]);
+  }, [user, loadCandidates, loadResumeUploads]);
 
   useEffect(() => {
     if (!allowedPages.has(activePage)) {
@@ -2277,8 +2304,6 @@ function App() {
       loadAuditLogs();
     }
   }, [loadAuditLogs, loadSecurityDashboard, safeActivePage, user]);
-
-  useEffect(() => stopUploadProgressSimulation, [stopUploadProgressSimulation]);
 
   useEffect(() => {
     setCurrentAuditPage(1);
@@ -2391,7 +2416,7 @@ function App() {
 
     setIsUploading(true);
     setMessage("");
-    beginUploadProgressSimulation();
+    setUploadError("");
 
     try {
       const successes = [];
@@ -2402,59 +2427,100 @@ function App() {
         formData.append("file", file);
 
         try {
+          setMessage(`Processing ${file.name}...`);
           const response = await api.post("/upload", formData, {
             headers: {
               "Content-Type": "multipart/form-data",
             },
           });
 
-          successes.push(`Saved candidate #${response.data.candidate_id}: ${file.name}`);
+          const resultStatus = String(response.data?.status || "ready").toLowerCase();
+          const finalLabel =
+            resultStatus === "ready"
+              ? "Ready"
+              : resultStatus === "needs_review"
+                ? "Needs Review"
+                : resultStatus === "unreadable"
+                  ? "Unreadable"
+                  : resultStatus === "rejected"
+                    ? "Rejected"
+                    : resultStatus === "failed"
+                      ? "Failed"
+                      : resultStatus === "security_blocked"
+                        ? "Security Blocked"
+                        : "Processing";
+
+          successes.push({
+            original_filename: file.name,
+            status: resultStatus,
+            processing_stage: response.data?.processing_stage || resultStatus,
+            candidate_id: response.data?.candidate_id ?? null,
+            safe_filename: response.data?.safe_filename || null,
+            message:
+              resultStatus === "ready"
+                ? "Resume processed successfully and is ready for matching."
+                : resultStatus === "needs_review"
+                  ? "We couldn't confidently read this resume automatically. It has been marked for review."
+                  : resultStatus === "unreadable"
+                    ? "We couldn't extract enough readable information from this document."
+                    : resultStatus === "rejected"
+                      ? "This document does not appear to be a resume."
+                      : resultStatus === "failed"
+                        ? "We couldn't finish processing this resume. Please try again."
+                        : response.data?.reason || "Your resume is being processed.",
+            label: finalLabel,
+            created_at: new Date().toISOString(),
+          });
         } catch (error) {
           console.error(error);
           const detail = error.response?.data?.detail;
           if (error.response?.status === 401) {
-            failUploadProgress("Your session expired. Please sign in again.");
             setUser(null);
             setMessage("Your session expired. Please sign in again.");
             return;
           }
 
-          failures.push(`${file.name}${detail ? ` - ${detail}` : ""}`);
+          const loweredDetail = String(detail || "").toLowerCase();
+          const status = error.response?.status === 409 || loweredDetail.includes("duplicate") ? "duplicate" : "failed";
+          failures.push({
+            original_filename: file.name,
+            status,
+            processing_stage: status,
+            candidate_id: null,
+            safe_filename: null,
+            message:
+              status === "duplicate"
+                ? detail || "This resume was already uploaded."
+                : detail || "We couldn't finish processing this resume. Please try again.",
+            label: status === "duplicate" ? "Duplicate" : "Failed",
+            created_at: new Date().toISOString(),
+          });
         }
       }
 
       if (failures.length) {
-        const failureMessage = `${successes.length} uploaded, ${failures.length} failed. ${failures.join("; ")}`;
-        failUploadProgress(failureMessage);
-        setMessage(failureMessage);
+        setMessage(`${successes.length} processed, ${failures.length} need attention.`);
       } else {
-        completeUploadProgress();
-        setMessage(
-          `${successes.length} resume${successes.length === 1 ? "" : "s"} uploaded successfully.`,
-        );
+        setMessage(`${successes.length} resume${successes.length === 1 ? "" : "s"} processed successfully.`);
         setFiles([]);
         if (uploadInputRef.current) {
           uploadInputRef.current.value = "";
         }
       }
       await loadCandidates();
+      await loadResumeUploads();
     } catch (error) {
       console.error(error);
       const detail = error.response?.data?.detail;
       if (error.response?.status === 401) {
-        failUploadProgress("Your session expired. Please sign in again.");
         setUser(null);
         setMessage("Your session expired. Please sign in again.");
-      } else if (error.response?.status === 409 && detail) {
-        failUploadProgress(detail);
-        setMessage(detail);
       } else {
-        const failureMessage = detail ? `Upload failed: ${detail}` : "Upload failed.";
-        failUploadProgress(failureMessage);
-        setMessage(failureMessage);
+        setMessage(detail ? `Upload failed: ${detail}` : "Upload failed.");
       }
     } finally {
       setIsUploading(false);
+      await loadResumeUploads();
     }
   };
 
@@ -2801,8 +2867,13 @@ function App() {
   }, [candidates, jobs]);
 
   const renderUploadPage = () => {
-    const shouldShowUploadProgress = uploadStatus !== "idle";
-    const progressLabel = `${Math.round(uploadProgress)}%`;
+    const pipelineSummary = [
+      { label: "Security Check", done: true },
+      { label: "Extract Text / OCR", done: true },
+      { label: "Validate Resume", done: true },
+      { label: "Parse Candidate", done: true },
+      { label: "Ready for Matching", done: true },
+    ];
 
     return (
       <section className="page-stack">
@@ -2888,51 +2959,107 @@ function App() {
               )}
             </div>
 
-            {shouldShowUploadProgress && (
-              <div className={`upload-progress-card is-${uploadStatus}`} role="status" aria-live="polite">
-                <div className="upload-progress-head">
-                  <strong>
-                    {uploadStatus === "success"
-                      ? "Complete!"
-                      : uploadStatus === "error"
-                        ? "Upload failed"
-                        : "Uploading and parsing resume..."}
-                  </strong>
-                  <span>{progressLabel}</span>
+            <section className="detail-card upload-process-card">
+              <div className="detail-card-header">
+                <div className="detail-card-kicker">
+                  <SparkIcon />
+                  <span>Upload Process</span>
                 </div>
-
-                <div className="upload-progress-track" aria-hidden="true">
-                  <span style={{ width: `${Math.min(100, Math.max(0, uploadProgress))}%` }} />
-                </div>
-
-                {uploadStatus === "success" ? (
-                  <div className="upload-progress-result">
-                    <span className="upload-result-icon" aria-hidden="true">
-                      <CheckIcon />
-                    </span>
-                    <div>
-                      <strong>Complete!</strong>
-                      <p>Resume uploaded and parsed successfully.</p>
-                    </div>
-                  </div>
-                ) : uploadStatus === "error" ? (
-                  <p className="upload-progress-error">{uploadError || "Upload failed."}</p>
-                ) : null}
+                <p>Security Check → Extract Text / OCR → Validate Resume → Parse Candidate → Ready for Matching</p>
               </div>
-            )}
+
+              <div className="upload-process-steps" aria-label="Resume upload pipeline">
+                {pipelineSummary.map((step, index) => (
+                  <div key={step.label} className="upload-process-step">
+                    <div className={`upload-process-step-icon ${step.done ? "is-complete" : ""}`} aria-hidden="true">
+                      {index + 1}
+                    </div>
+                    <strong>{step.label}</strong>
+                  </div>
+                ))}
+              </div>
+
+              <p className="status-message">
+                Uploading a resume does not make it available for matching until backend processing marks it ready.
+              </p>
+            </section>
 
             <div className="upload-action-buttons">
-              <button className="secondary-button" type="button" onClick={clearUploadSelection} disabled={!files.length && !message && uploadStatus === "idle"}>
+              <button className="secondary-button" type="button" onClick={clearUploadSelection} disabled={!files.length && !message}>
                 Clear
               </button>
               <button className="primary-button" onClick={handleUpload} disabled={isUploading || files.length === 0}>
-                {isUploading ? "Uploading..." : "Upload Resume"}
+                {isUploading ? "Processing..." : "Upload Resume"}
               </button>
             </div>
 
             <p className="status-message">
-              {message || "The file will be uploaded with the existing backend endpoint."}
+              {isUploading ? "Your resume is being processed." : message || "The file will be uploaded with the existing backend endpoint."}
             </p>
+          </div>
+        </section>
+
+        <section className="surface-block">
+          <div className="surface-header">
+            <div>
+              <h2>Recent Uploads</h2>
+              <p className="subtitle">Track the latest resume processing results.</p>
+            </div>
+          </div>
+
+          <div className="table-shell compact-table-shell">
+            <table className="data-table recent-table">
+              <thead>
+                <tr>
+                  <th>File</th>
+                  <th>Status</th>
+                  <th>Progress</th>
+                  <th>Uploaded</th>
+                  <th>Next Step</th>
+                </tr>
+              </thead>
+              <tbody>
+                {isLoadingUploadRecords ? (
+                  <tr>
+                    <td className="empty-state" colSpan="5">Loading uploads...</td>
+                  </tr>
+                ) : uploadRecords.length === 0 ? (
+                  <tr>
+                    <td className="empty-state" colSpan="5">No recent uploads yet.</td>
+                  </tr>
+                ) : (
+                  uploadRecords.map((upload) => {
+                    const statusInfo = formatUploadStatus(upload);
+                    return (
+                      <tr key={upload.id}>
+                        <td>
+                          <strong>{formatValue(upload.original_filename)}</strong>
+                          <div className="table-subtext">{formatValue(upload.file_type || "Resume file")}</div>
+                        </td>
+                        <td>
+                          <span className={`status-pill status-${statusInfo.tone}`}>{statusInfo.label}</span>
+                          <div className="table-subtext">{statusInfo.message}</div>
+                        </td>
+                        <td>
+                          <strong>{formatUploadStageLabel(upload)}</strong>
+                          <div className="table-subtext">{upload.ocr_required ? "OCR review flagged" : "Automatic processing"}</div>
+                        </td>
+                        <td>{formatDate(upload.created_at || upload.updated_at)}</td>
+                        <td>
+                          {String(upload.status || "").toLowerCase() === "ready" && upload.candidate_id ? (
+                            <button className="secondary-button" type="button" onClick={() => { setActivePage("candidates"); setSelectedCandidate(null); loadCandidates(); }}>
+                              View Candidate
+                            </button>
+                          ) : (
+                            <span className="table-subtext">Matching becomes available after Ready.</span>
+                          )}
+                        </td>
+                      </tr>
+                    );
+                  })
+                )}
+              </tbody>
+            </table>
           </div>
         </section>
       </section>

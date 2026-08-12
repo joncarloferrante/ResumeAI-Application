@@ -35,11 +35,21 @@ else:
     DB_INTEGRITY_ERROR = (sqlite3.IntegrityError,)
 
 from .auth_utils import hash_password, verify_password
-from .resume_parser import parse_resume_file
+from .resume_parser import parse_resume_file_with_text
+from .resume_upload_pipeline import (
+    ExtractionResult,
+    MIN_TEXT_CHARS,
+    MIN_WORD_COUNT,
+    extract_text_with_ocr,
+    is_meaningful_text,
+    validate_resume_content,
+)
 from .database import (
     create_audit_log,
     apply_qwen_final_review,
+    build_safe_resume_filename,
     create_user,
+    create_resume_upload_record,
     calculate_job_match,
     delete_candidate,
     delete_user_record,
@@ -56,11 +66,15 @@ from .database import (
     get_scraped_jobs,
     get_scraped_job_matches,
     get_scraped_job_cached_matches,
+    get_resume_uploads_for_user,
+    get_resume_upload_by_candidate_id,
     mark_user_login,
     init_db,
     reset_user_password,
     save_candidate,
     set_user_lock_status,
+    sanitize_resume_filename,
+    update_resume_upload_status,
     ensure_scraped_job_edit_columns,
     update_scraped_job,
     update_user,
@@ -138,11 +152,18 @@ UPLOAD_DIR = PROJECT_ROOT / "uploads"
 if not UPLOAD_DIR.exists():
     UPLOAD_DIR.mkdir(exist_ok=True)
     file_logger.info("Upload directory created | path=%s", UPLOAD_DIR)
+MAX_RESUME_UPLOAD_MB = max(1, int(os.environ.get("MAX_RESUME_UPLOAD_MB", "20") or 20))
+MAX_RESUME_UPLOAD_BYTES = MAX_RESUME_UPLOAD_MB * 1024 * 1024
 SESSION_COOKIE_NAME = "resumeai_session"
 SESSION_MAX_AGE_SECONDS = 60 * 60 * 8
 SESSION_SECRET = os.environ.get("RESUMEAI_SESSION_SECRET", "dev-only-change-me")
 ENABLE_REGISTRATION = os.environ.get("ENABLE_REGISTRATION", "").lower() == "true"
 DUPLICATE_RESUME_MESSAGE = "This resume was already uploaded."
+SUPPORTED_RESUME_MIME_TYPES = {
+    "application/pdf",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+}
+SUPPORTED_RESUME_EXTENSIONS = {".pdf", ".docx"}
 
 
 def _is_production_cookie_mode() -> bool:
@@ -331,6 +352,105 @@ def delete_uploaded_resume_file(filename: str | None) -> bool:
 
     file_logger.warning("File not found | filename=%s", filename)
     return False
+
+
+def _get_resume_file_extension(filename: str | None) -> str:
+    return Path(str(filename or "")).suffix.lower().strip()
+
+
+def _detect_resume_signature(path: Path) -> tuple[str, str | None]:
+    try:
+        with path.open("rb") as handle:
+            header = handle.read(8)
+    except OSError as exc:
+        return "invalid", str(exc)
+
+    if header.startswith(b"%PDF-"):
+        return "pdf", None
+
+    if header.startswith(b"PK"):
+        try:
+            import zipfile
+
+            with zipfile.ZipFile(path) as archive:
+                names = set(archive.namelist())
+                if "[Content_Types].xml" in names and any(name.startswith("word/") for name in names):
+                    return "docx", None
+        except zipfile.BadZipFile:
+            return "invalid", "The uploaded file is not a valid DOCX archive."
+        except RuntimeError as exc:
+            return "invalid", str(exc)
+
+    return "invalid", "Unsupported file signature."
+
+
+def _is_password_protected_pdf(path: Path) -> bool:
+    try:
+        from pypdf import PdfReader
+    except ImportError:
+        return False
+
+    try:
+        reader = PdfReader(str(path))
+        return bool(getattr(reader, "is_encrypted", False))
+    except Exception:
+        return False
+
+
+def _is_password_protected_docx(path: Path) -> bool:
+    try:
+        import zipfile
+
+        return zipfile.is_zipfile(path) and any(part.startswith("EncryptedPackage") for part in zipfile.ZipFile(path).namelist())
+    except Exception:
+        return False
+
+
+def _validate_upload_metadata(file: UploadFile, save_path: Path, file_size: int) -> tuple[str, str, str | None]:
+    extension = _get_resume_file_extension(file.filename)
+    if extension not in SUPPORTED_RESUME_EXTENSIONS:
+        return "rejected", "Unsupported file type. Please upload a PDF or DOCX resume.", "unsupported_extension"
+
+    if file_size <= 0:
+        return "rejected", "The uploaded file is empty.", "empty_file"
+
+    if file_size > MAX_RESUME_UPLOAD_BYTES:
+        return "rejected", f"File is too large. Maximum size is {MAX_RESUME_UPLOAD_MB} MB.", "file_too_large"
+
+    detected_type, signature_error = _detect_resume_signature(save_path)
+    if detected_type == "invalid":
+        return "rejected", signature_error or "The file could not be validated.", "invalid_signature"
+
+    if detected_type == "pdf" and _is_password_protected_pdf(save_path):
+        return "rejected", "Password-protected PDFs cannot be processed.", "password_protected"
+
+    if detected_type == "docx" and _is_password_protected_docx(save_path):
+        return "rejected", "Password-protected DOCX files cannot be processed.", "password_protected"
+
+    supplied_type = str(file.content_type or "").lower()
+    if supplied_type and supplied_type not in SUPPORTED_RESUME_MIME_TYPES:
+        return "rejected", "The file type does not match a supported resume format.", "mime_mismatch"
+
+    return "ready", "", detected_type
+
+
+def _record_upload_stage(upload_id: int, *, stage: str, status: str, reason: str | None = None, ocr_required: bool | None = None) -> None:
+    update_resume_upload_status(
+        upload_id,
+        processing_stage=stage,
+        status=status,
+        failure_reason=reason,
+        ocr_required=ocr_required,
+    )
+
+
+def _mark_upload_failed(upload_id: int, reason: str, status: str = "failed") -> None:
+    update_resume_upload_status(
+        upload_id,
+        status=status,
+        failure_reason=reason,
+        processing_stage="failed",
+    )
 
 
 def log_parsed_resume_debug(filename: str, parsed_data: dict) -> None:
@@ -651,70 +771,265 @@ def security_dashboard(current_user: dict = Depends(require_admin)):
 
 @app.post("/upload")
 async def upload_resume(file: UploadFile = File(...), current_user: dict = Depends(get_current_user)):
+    original_filename = sanitize_resume_filename(file.filename)
     upload_logger.info(
         "Upload started | user_id=%s | filename=%s | content_type=%s",
         current_user.get("id"),
-        file.filename,
+        original_filename,
         file.content_type,
     )
-    save_path = UPLOAD_DIR / file.filename
     file.file.seek(0, os.SEEK_END)
     file_size = file.file.tell()
     file.file.seek(0)
-    upload_logger.info("Uploaded filename=%s | size=%s bytes | type=%s", file.filename, file_size, file.content_type)
+    upload_logger.info("Uploaded filename=%s | size=%s bytes | type=%s", original_filename, file_size, file.content_type)
+
+    if file_size > MAX_RESUME_UPLOAD_BYTES:
+        create_audit_log(
+            current_user["email"],
+            "Resume Upload",
+            {"filename": original_filename, "reason": f"File is too large. Maximum size is {MAX_RESUME_UPLOAD_MB} MB."},
+            "failed",
+        )
+        raise HTTPException(status_code=400, detail=f"File is too large. Maximum size is {MAX_RESUME_UPLOAD_MB} MB.")
+
+    safe_filename = build_safe_resume_filename(original_filename)
+    save_path = UPLOAD_DIR / safe_filename
+    upload_id = create_resume_upload_record(
+        uploader_email=current_user["email"],
+        original_filename=original_filename,
+        safe_filename=safe_filename,
+        file_type=file.content_type,
+        file_size_bytes=file_size,
+        status="uploaded",
+        processing_stage="uploaded",
+    )
+
+    _record_upload_stage(upload_id, stage="security_check", status="security_check")
 
     with save_path.open("wb") as buffer:
         shutil.copyfileobj(file.file, buffer)
 
     file_hash = calculate_file_hash(save_path)
-    if find_duplicate_candidate(file.filename, "", file_hash):
+    validation_status, validation_message, detected_type = _validate_upload_metadata(file, save_path, file_size)
+    if validation_status != "ready":
+        _record_upload_stage(
+            upload_id,
+            stage="rejected",
+            status=validation_status,
+            reason=validation_message,
+        )
         create_audit_log(
             current_user["email"],
             "Resume Upload",
-            {"filename": file.filename, "reason": DUPLICATE_RESUME_MESSAGE},
+            {"filename": original_filename, "reason": validation_message, "status": validation_status},
             "failed",
         )
-        upload_logger.warning("Upload failed | filename=%s | reason=duplicate", file.filename)
+        upload_logger.warning("Upload rejected | filename=%s | reason=%s", original_filename, validation_message)
+        raise HTTPException(status_code=400, detail=validation_message)
+
+    if find_duplicate_candidate(original_filename, "", file_hash):
+        create_audit_log(
+            current_user["email"],
+            "Resume Upload",
+            {"filename": original_filename, "reason": DUPLICATE_RESUME_MESSAGE},
+            "failed",
+        )
+        _mark_upload_failed(upload_id, DUPLICATE_RESUME_MESSAGE, status="rejected")
+        upload_logger.warning("Upload failed | filename=%s | reason=duplicate", original_filename)
         raise HTTPException(status_code=409, detail=DUPLICATE_RESUME_MESSAGE)
 
     try:
-        parser_logger.info("Parsing started | filename=%s", file.filename)
-        parsed_data = parse_resume_file(save_path)
-        parser_logger.info("Parsing completed | filename=%s", file.filename)
+        _record_upload_stage(upload_id, stage="extracting_text", status="extracting_text")
+        parser_logger.info("Text extraction started | filename=%s", original_filename)
+        extraction = extract_text_with_ocr(save_path)
+        extracted_text = extraction.text or ""
+
+        if extraction.ocr_attempted and not extraction.ocr_available:
+            _record_upload_stage(
+                upload_id,
+                stage="needs_review",
+                status="needs_review",
+                reason="OCR is not configured for this environment.",
+                ocr_required=True,
+            )
+            create_audit_log(
+                current_user["email"],
+                "Resume Upload",
+                {
+                    "filename": original_filename,
+                    "safe_filename": safe_filename,
+                    "reason": "OCR is not configured for this environment.",
+                    "status": "needs_review",
+                },
+                "success",
+            )
+            return {
+                "filename": original_filename,
+                "safe_filename": safe_filename,
+                "status": "needs_review",
+                "candidate_id": None,
+                "saved_to": str(save_path),
+                "reason": "We couldn't confidently read enough information from this resume.",
+            }
+
+        if not is_meaningful_text(extracted_text, extraction.page_count):
+            if extraction.is_scanned:
+                if extraction.ocr_available:
+                    _record_upload_stage(
+                        upload_id,
+                        stage="ocr_processing",
+                        status="ocr_processing",
+                        reason="OCR is processing a scanned document.",
+                        ocr_required=True,
+                    )
+                    extracted_text = extraction.text or ""
+                    if not is_meaningful_text(extracted_text, extraction.page_count):
+                        _record_upload_stage(
+                            upload_id,
+                            stage="unreadable",
+                            status="unreadable",
+                            reason="OCR could not recover enough readable text.",
+                            ocr_required=True,
+                        )
+                        create_audit_log(
+                            current_user["email"],
+                            "Resume Upload",
+                            {"filename": original_filename, "safe_filename": safe_filename, "reason": "OCR could not recover enough readable text.", "status": "unreadable"},
+                            "success",
+                        )
+                        return {
+                            "filename": original_filename,
+                            "safe_filename": safe_filename,
+                            "status": "unreadable",
+                            "candidate_id": None,
+                            "saved_to": str(save_path),
+                            "reason": "No readable text could be extracted.",
+                        }
+                else:
+                    _record_upload_stage(
+                        upload_id,
+                        stage="needs_review",
+                        status="needs_review",
+                        reason="The document appears to be scanned and requires OCR.",
+                        ocr_required=True,
+                    )
+                    create_audit_log(
+                        current_user["email"],
+                        "Resume Upload",
+                        {"filename": original_filename, "safe_filename": safe_filename, "reason": "The document appears to be scanned and requires OCR.", "status": "needs_review"},
+                        "success",
+                    )
+                    return {
+                        "filename": original_filename,
+                        "safe_filename": safe_filename,
+                        "status": "needs_review",
+                        "candidate_id": None,
+                        "saved_to": str(save_path),
+                        "reason": "The document appears to be scanned and requires OCR.",
+                    }
+            else:
+                _record_upload_stage(
+                    upload_id,
+                    stage="needs_review",
+                    status="needs_review",
+                    reason="Not enough readable text could be extracted.",
+                )
+                create_audit_log(
+                    current_user["email"],
+                    "Resume Upload",
+                    {"filename": original_filename, "safe_filename": safe_filename, "reason": "Not enough readable text could be extracted.", "status": "needs_review"},
+                    "success",
+                )
+                return {
+                    "filename": original_filename,
+                    "safe_filename": safe_filename,
+                    "status": "needs_review",
+                    "candidate_id": None,
+                    "saved_to": str(save_path),
+                    "reason": "We couldn't confidently read enough information from this resume.",
+                }
+
+        _record_upload_stage(upload_id, stage="validating", status="validating")
+        content_validation = validate_resume_content(extracted_text)
+        if not content_validation.is_resume:
+            rejection_reason = "This document does not appear to be a resume."
+            _record_upload_stage(
+                upload_id,
+                stage="rejected",
+                status="rejected",
+                reason=rejection_reason,
+            )
+            create_audit_log(
+                current_user["email"],
+                "Resume Upload",
+                {
+                    "filename": original_filename,
+                    "safe_filename": safe_filename,
+                    "reason": rejection_reason,
+                    "status": "rejected",
+                    "validation_signals": content_validation.signals,
+                },
+                "failed",
+            )
+            return {
+                "filename": original_filename,
+                "safe_filename": safe_filename,
+                "status": "rejected",
+                "candidate_id": None,
+                "saved_to": str(save_path),
+                "reason": rejection_reason,
+            }
+
+        _record_upload_stage(upload_id, stage="parsing", status="parsing")
+        parser_logger.info("Parsing started | filename=%s", original_filename)
+        parsed_data = parse_resume_file_with_text(save_path, extracted_text)
+        parser_logger.info("Parsing completed | filename=%s", original_filename)
     except Exception as exc:
+        _mark_upload_failed(upload_id, str(exc))
         create_audit_log(
             current_user["email"],
             "Resume Upload",
-            {"filename": file.filename, "reason": str(exc)},
+            {"filename": original_filename, "reason": str(exc)},
             "failed",
         )
-        upload_logger.exception("Upload failed | filename=%s", file.filename)
+        upload_logger.exception("Upload failed | filename=%s", original_filename)
         raise HTTPException(status_code=400, detail=str(exc))
 
-    log_parsed_resume_debug(file.filename, parsed_data)
+    log_parsed_resume_debug(original_filename, parsed_data)
 
-    candidate_id = save_candidate(file.filename, parsed_data, file_hash)
+    candidate_id = save_candidate(original_filename, parsed_data, file_hash)
     if candidate_id is None:
+        _mark_upload_failed(upload_id, DUPLICATE_RESUME_MESSAGE, status="rejected")
         create_audit_log(
             current_user["email"],
             "Resume Upload",
-            {"filename": file.filename, "reason": DUPLICATE_RESUME_MESSAGE},
+            {"filename": original_filename, "reason": DUPLICATE_RESUME_MESSAGE},
             "failed",
         )
-        upload_logger.warning("Upload failed | filename=%s | reason=duplicate after parse", file.filename)
+        upload_logger.warning("Upload failed | filename=%s | reason=duplicate after parse", original_filename)
         raise HTTPException(status_code=409, detail=DUPLICATE_RESUME_MESSAGE)
+
+    update_resume_upload_status(
+        upload_id,
+        candidate_id=candidate_id,
+        status="ready",
+        processing_stage="ready",
+        ready=True,
+        failure_reason=None,
+    )
 
     create_audit_log(
         current_user["email"],
         "Resume Upload",
-        {"candidate_id": candidate_id, "filename": file.filename},
+        {"candidate_id": candidate_id, "filename": original_filename, "safe_filename": safe_filename},
         "success",
     )
-    upload_logger.info("Upload completed | filename=%s | candidate_id=%s", file.filename, candidate_id)
+    upload_logger.info("Upload completed | filename=%s | candidate_id=%s", original_filename, candidate_id)
 
     return {
-        "filename": file.filename,
-        "status": "uploaded_parsed_and_saved",
+        "filename": original_filename,
+        "safe_filename": safe_filename,
+        "status": "ready",
         "candidate_id": candidate_id,
         "saved_to": str(save_path),
         "parsed_data": parsed_data,
@@ -729,6 +1044,34 @@ def list_candidates(current_user: dict = Depends(get_current_user)):
 @app.get("/analytics")
 def analytics(current_user: dict = Depends(get_current_user)):
     return get_dashboard_analytics()
+
+
+@app.get("/resume-uploads")
+def resume_uploads(current_user: dict = Depends(get_current_user), limit: int = Query(default=10, ge=1, le=50)):
+    uploads = get_resume_uploads_for_user(
+        current_user.get("email"),
+        limit=limit,
+        is_admin=current_user.get("role") == "admin",
+    )
+    return {
+        "uploads": [
+            {
+                "id": upload.get("id"),
+                "candidate_id": upload.get("candidate_id"),
+                "original_filename": upload.get("original_filename"),
+                "safe_filename": upload.get("safe_filename"),
+                "file_type": upload.get("file_type"),
+                "file_size_bytes": upload.get("file_size_bytes"),
+                "status": upload.get("status"),
+                "processing_stage": upload.get("processing_stage"),
+                "ocr_required": bool(upload.get("ocr_required")),
+                "created_at": upload.get("created_at"),
+                "updated_at": upload.get("updated_at"),
+                "ready_at": upload.get("ready_at"),
+            }
+            for upload in uploads
+        ]
+    }
 
 
 @app.get("/candidates/{candidate_id}")
@@ -779,7 +1122,8 @@ def remove_candidate(candidate_id: int, current_user: dict = Depends(get_current
         )
         raise HTTPException(status_code=404, detail="Candidate not found")
 
-    file_deleted = delete_uploaded_resume_file(candidate.get("filename"))
+    upload_record = get_resume_upload_by_candidate_id(candidate_id)
+    file_deleted = delete_uploaded_resume_file(upload_record.get("safe_filename") if upload_record else candidate.get("filename"))
     delete_candidate(candidate_id)
     create_audit_log(
         current_user["email"],

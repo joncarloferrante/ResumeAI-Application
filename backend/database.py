@@ -107,6 +107,43 @@ JOB_SOURCES_TABLE_SQL = """
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )
 """
+RESUME_UPLOADS_TABLE_SQL = """
+    CREATE TABLE IF NOT EXISTS resume_uploads (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        candidate_id INTEGER,
+        uploader_email TEXT,
+        original_filename TEXT NOT NULL,
+        safe_filename TEXT NOT NULL UNIQUE,
+        file_type TEXT,
+        file_size_bytes INTEGER NOT NULL DEFAULT 0,
+        status TEXT NOT NULL DEFAULT 'uploaded',
+        security_status TEXT,
+        security_scan_status TEXT,
+        security_reason TEXT,
+        validation_status TEXT,
+        validation_reason TEXT,
+        ocr_required INTEGER NOT NULL DEFAULT 0,
+        processing_stage TEXT,
+        failure_reason TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        ready_at TIMESTAMP
+    )
+"""
+RESUME_UPLOAD_STATUSES = {
+    "uploaded",
+    "security_check",
+    "extracting_text",
+    "ocr_processing",
+    "validating",
+    "parsing",
+    "ready",
+    "needs_review",
+    "unreadable",
+    "rejected",
+    "failed",
+    "security_blocked",
+}
 
 from .logging_config import get_logger
 
@@ -607,6 +644,39 @@ def init_db():
         )
     """)
 
+    cursor.execute(RESUME_UPLOADS_TABLE_SQL)
+    upload_columns = _fetch_table_columns(conn, "resume_uploads")
+    for column_name, column_definition in {
+        "candidate_id": "INTEGER",
+        "uploader_email": "TEXT",
+        "safe_filename": "TEXT",
+        "file_type": "TEXT",
+        "file_size_bytes": "INTEGER NOT NULL DEFAULT 0",
+        "status": "TEXT NOT NULL DEFAULT 'uploaded'",
+        "security_status": "TEXT",
+        "security_scan_status": "TEXT",
+        "security_reason": "TEXT",
+        "validation_status": "TEXT",
+        "validation_reason": "TEXT",
+        "ocr_required": "INTEGER NOT NULL DEFAULT 0",
+        "processing_stage": "TEXT",
+        "failure_reason": "TEXT",
+        "ready_at": "TIMESTAMP",
+    }.items():
+        if column_name not in upload_columns:
+            cursor.execute(f"ALTER TABLE resume_uploads ADD COLUMN {column_name} {column_definition}")
+
+    if "safe_filename" in upload_columns:
+        cursor.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_resume_uploads_safe_filename
+            ON resume_uploads(safe_filename)
+        """)
+    if "candidate_id" in upload_columns:
+        cursor.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_resume_uploads_candidate_id
+            ON resume_uploads(candidate_id)
+        """)
+
     candidate_columns = _fetch_table_columns(conn, "candidates")
     for column_name, column_definition in {
         "current_title": "TEXT",
@@ -905,6 +975,182 @@ def find_duplicate_candidate(filename: str, email: str, file_hash: str | None = 
     return dict(row) if row else None
 
 
+def sanitize_resume_filename(filename: str) -> str:
+    base_name = Path(str(filename or "")).name
+    base_name = re.sub(r"[^A-Za-z0-9._-]+", "_", base_name).strip("._-")
+    return base_name or "resume"
+
+
+def build_safe_resume_filename(original_filename: str, file_hash: str | None = None) -> str:
+    safe_original = sanitize_resume_filename(original_filename)
+    suffix = Path(safe_original).suffix.lower()
+    stem = Path(safe_original).stem
+    token = (file_hash or hashlib.sha256(f"{safe_original}-{time.time()}".encode("utf-8")).hexdigest())[:12]
+    return f"{stem}_{token}{suffix}"
+
+
+def create_resume_upload_record(
+    *,
+    uploader_email: str,
+    original_filename: str,
+    safe_filename: str,
+    file_type: str | None,
+    file_size_bytes: int,
+    status: str = "uploaded",
+    security_status: str | None = None,
+    security_scan_status: str | None = None,
+    security_reason: str | None = None,
+    validation_status: str | None = None,
+    validation_reason: str | None = None,
+    ocr_required: bool = False,
+    processing_stage: str | None = None,
+    failure_reason: str | None = None,
+    candidate_id: int | None = None,
+) -> int:
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        INSERT INTO resume_uploads (
+            candidate_id,
+            uploader_email,
+            original_filename,
+            safe_filename,
+            file_type,
+            file_size_bytes,
+            status,
+            security_status,
+            security_scan_status,
+            security_reason,
+            validation_status,
+            validation_reason,
+            ocr_required,
+            processing_stage,
+            failure_reason,
+            updated_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+    """, (
+        candidate_id,
+        uploader_email,
+        original_filename,
+        safe_filename,
+        file_type,
+        int(file_size_bytes or 0),
+        status,
+        security_status,
+        security_scan_status,
+        security_reason,
+        validation_status,
+        validation_reason,
+        1 if ocr_required else 0,
+        processing_stage,
+        failure_reason,
+    ))
+    upload_id = cursor.lastrowid
+    conn.commit()
+    conn.close()
+    return upload_id
+
+
+def update_resume_upload_status(
+    upload_id: int,
+    *,
+    status: str | None = None,
+    security_status: str | None = None,
+    security_scan_status: str | None = None,
+    security_reason: str | None = None,
+    validation_status: str | None = None,
+    validation_reason: str | None = None,
+    ocr_required: bool | None = None,
+    processing_stage: str | None = None,
+    failure_reason: str | None = None,
+    candidate_id: int | None = None,
+    ready: bool = False,
+) -> None:
+    updates = []
+    params = []
+    for column, value in [
+        ("status", status),
+        ("security_status", security_status),
+        ("security_scan_status", security_scan_status),
+        ("security_reason", security_reason),
+        ("validation_status", validation_status),
+        ("validation_reason", validation_reason),
+        ("processing_stage", processing_stage),
+        ("failure_reason", failure_reason),
+    ]:
+        if value is not None:
+            updates.append(f"{column} = ?")
+            params.append(value)
+    if ocr_required is not None:
+        updates.append("ocr_required = ?")
+        params.append(1 if ocr_required else 0)
+    if candidate_id is not None:
+        updates.append("candidate_id = ?")
+        params.append(candidate_id)
+    if ready:
+        updates.append("ready_at = CURRENT_TIMESTAMP")
+    if not updates:
+        return
+    updates.append("updated_at = CURRENT_TIMESTAMP")
+    params.append(upload_id)
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(f"UPDATE resume_uploads SET {', '.join(updates)} WHERE id = ?", params)
+    conn.commit()
+    conn.close()
+
+
+def get_resume_upload_by_candidate_id(candidate_id: int):
+    conn = get_connection()
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT *
+        FROM resume_uploads
+        WHERE candidate_id = ?
+        ORDER BY id DESC
+        LIMIT 1
+    """, (candidate_id,))
+    row = cursor.fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def get_resume_uploads_for_user(user_email: str | None, limit: int = 10, *, is_admin: bool = False):
+    conn = get_connection()
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+    if is_admin:
+        cursor.execute("""
+            SELECT *
+            FROM resume_uploads
+            ORDER BY id DESC
+            LIMIT ?
+        """, (limit,))
+    else:
+        cursor.execute("""
+            SELECT *
+            FROM resume_uploads
+            WHERE uploader_email = ?
+            ORDER BY id DESC
+            LIMIT ?
+        """, (user_email, limit))
+    rows = [dict(row) for row in cursor.fetchall()]
+    conn.close()
+    return rows
+
+
+def is_candidate_matching_eligible(candidate: dict) -> bool:
+    candidate_id = candidate.get("id") if isinstance(candidate, dict) else None
+    if candidate_id is None:
+        return False
+    upload_record = get_resume_upload_by_candidate_id(int(candidate_id))
+    if not upload_record:
+        return True
+    return str(upload_record.get("status") or "").lower() == "ready"
+
+
 def save_candidate(filename: str, parsed_data: dict, file_hash: str | None = None) -> int | None:
     email = str(parsed_data.get("Email", "")).strip()
     if find_duplicate_candidate(filename, email, file_hash):
@@ -996,29 +1242,31 @@ def get_candidates():
 
     cursor.execute("""
         SELECT
-            id,
-            filename,
-            candidate,
-            email,
-            phone,
-            employment_status,
-            graduation_year,
-            total_experience_years,
-            career_span_years,
-            skills,
-            normalized_skills,
-            current_position,
-            current_company,
-            resume_summary,
-            needs_review,
-            current_title,
-            industries,
-            certifications,
-            education,
-            keywords,
-            created_at
-        FROM candidates
-        ORDER BY id DESC
+            c.id,
+            c.filename,
+            c.candidate,
+            c.email,
+            c.phone,
+            c.employment_status,
+            c.graduation_year,
+            c.total_experience_years,
+            c.career_span_years,
+            c.skills,
+            c.normalized_skills,
+            c.current_position,
+            c.current_company,
+            c.resume_summary,
+            c.needs_review,
+            c.current_title,
+            c.industries,
+            c.certifications,
+            c.education,
+            c.keywords,
+            c.created_at
+        FROM candidates c
+        LEFT JOIN resume_uploads ru ON ru.candidate_id = c.id
+        WHERE ru.id IS NULL OR LOWER(COALESCE(ru.status, 'ready')) = 'ready'
+        ORDER BY c.id DESC
     """)
 
     rows = [dict(row) for row in cursor.fetchall()]

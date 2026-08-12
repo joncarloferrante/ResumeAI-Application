@@ -2459,10 +2459,11 @@ def parse_resume(
     model: str,
     use_llm: bool,
     allow_regex_fallback: bool,
+    raw_text: str | None = None,
 ) -> dict:
     """Parse one resume file and return one CSV row dictionary."""
-    raw_text = read_resume_text(path)
-    text = clean_text(raw_text)
+    text_source = raw_text if raw_text is not None else read_resume_text(path)
+    text = clean_text(text_source)
 
     qwen_data: Dict[str, Any] = {}
     qwen_notes: List[str] = []
