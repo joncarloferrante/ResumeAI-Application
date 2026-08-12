@@ -2502,10 +2502,11 @@ function App() {
         setMessage(`${successes.length} processed, ${failures.length} need attention.`);
       } else {
         setMessage(`${successes.length} resume${successes.length === 1 ? "" : "s"} processed successfully.`);
-        setFiles([]);
-        if (uploadInputRef.current) {
-          uploadInputRef.current.value = "";
-        }
+      }
+
+      setFiles([]);
+      if (uploadInputRef.current) {
+        uploadInputRef.current.value = "";
       }
       await loadCandidates();
       await loadResumeUploads();
@@ -3042,7 +3043,14 @@ function App() {
                         <td>{formatDate(upload.created_at || upload.updated_at)}</td>
                         <td>
                           {String(upload.status || "").toLowerCase() === "ready" && upload.candidate_id ? (
-                            <button className="secondary-button" type="button" onClick={() => { setActivePage("candidates"); setSelectedCandidate(null); loadCandidates(); }}>
+                            <button
+                              className="secondary-button"
+                              type="button"
+                              onClick={() => {
+                                setActivePage("candidates");
+                                void handleViewCandidate({ id: upload.candidate_id });
+                              }}
+                            >
                               View Candidate
                             </button>
                           ) : (
