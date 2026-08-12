@@ -2544,8 +2544,6 @@ function App() {
     }
 
     if (supportedFiles.length > 0) {
-      setUploadProgress(0);
-      setUploadStatus("idle");
       setUploadError("");
       setFiles((currentFiles) => [...currentFiles, ...supportedFiles]);
       nextMessage =
@@ -2573,11 +2571,8 @@ function App() {
   };
 
   const clearUploadSelection = () => {
-    stopUploadProgressSimulation();
     setFiles([]);
     setMessage("");
-    setUploadProgress(0);
-    setUploadStatus("idle");
     setUploadError("");
     if (uploadInputRef.current) {
       uploadInputRef.current.value = "";
