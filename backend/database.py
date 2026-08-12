@@ -2186,6 +2186,83 @@ def calculate_job_match(job: dict, candidate: dict, *, use_cache: bool = True, f
     }
 
 
+def precompute_python_matches(
+    jobs: list[dict] | None = None,
+    candidates: list[dict] | None = None,
+    *,
+    active_jobs_only: bool = True,
+    force_refresh: bool = False,
+) -> dict:
+    """Precompute and persist Python-only job/candidate matches using the existing cache."""
+    if jobs is None:
+        job_payload = get_scraped_jobs()
+        jobs = list(job_payload.get("jobs", []) if isinstance(job_payload, dict) else job_payload or [])
+    if candidates is None:
+        candidates = get_candidates()
+
+    if active_jobs_only:
+        jobs = [job for job in jobs if int(job.get("active", 0) or 0) == 1]
+
+    started_at = time.perf_counter()
+    considered_pairs = 0
+    cache_hits = 0
+    recalculated_pairs = 0
+    stored_pairs = 0
+    errors = []
+
+    for job in jobs:
+        job_context = _job_match_context(job)
+        job_fingerprint = _fingerprint(job_context)
+        for candidate in candidates:
+            considered_pairs += 1
+            try:
+                candidate_context = _candidate_match_context(candidate)
+                candidate_fingerprint = _fingerprint(candidate_context)
+                cached_match = None if force_refresh else _get_cached_match(
+                    job.get("id"),
+                    candidate.get("id"),
+                    job_fingerprint,
+                    candidate_fingerprint,
+                )
+
+                if cached_match and not cached_match.get("is_stale"):
+                    cache_hits += 1
+                    continue
+
+                recalculated_pairs += 1
+                calculate_job_match(
+                    job,
+                    candidate,
+                    use_cache=not force_refresh,
+                    force_refresh=force_refresh,
+                    persist=True,
+                )
+                stored_pairs += 1
+            except Exception as exc:
+                errors.append({
+                    "job_id": job.get("id"),
+                    "candidate_id": candidate.get("id"),
+                    "error": str(exc),
+                })
+                matcher_logger.exception(
+                    "Python precompute failed | job_id=%s | candidate_id=%s",
+                    job.get("id"),
+                    candidate.get("id"),
+                )
+
+    elapsed_seconds = time.perf_counter() - started_at
+    return {
+        "jobs_considered": len(jobs),
+        "candidates_considered": len(candidates),
+        "pairs_considered": considered_pairs,
+        "cache_hits": cache_hits,
+        "pairs_recalculated": recalculated_pairs,
+        "pairs_stored": stored_pairs,
+        "elapsed_seconds": elapsed_seconds,
+        "errors": errors,
+    }
+
+
 def get_scraped_job_matches(job_identifier: int | str, *, refresh: bool = False):
     with get_connection() as conn:
         conn.row_factory = sqlite3.Row
@@ -2290,6 +2367,79 @@ def get_scraped_job_matches(job_identifier: int | str, *, refresh: bool = False)
         "matches": matches,
         "total_resumes": len(candidates),
         "strong_matches": [match for match in matches if match["match_score"] >= 70],
+    }
+
+
+def get_scraped_job_cached_matches(job_identifier: int | str):
+    """Return only already-cached deep matches for a scraped job without recalculating anything."""
+    with get_connection() as conn:
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT id, title, department, location, employment_type, job_number, salary, description, url, active, last_scraped, source, company
+            FROM scraped_jobs
+            WHERE id = ?
+        """, (job_identifier,))
+        job_row = cursor.fetchone()
+
+    if not job_row:
+        return None
+
+    job = dict(job_row)
+    candidates = get_candidates()
+    if not candidates:
+        return {"job": job, "job_id": job.get("id"), "matches": [], "total_resumes": 0, "strong_matches": [], "cached_only": True}
+
+    synthetic_job = {
+        "id": job["id"],
+        "title": job["title"],
+        "department": job.get("department", ""),
+        "location": job.get("location", ""),
+        "job_type": job.get("employment_type", ""),
+        "status": "open" if job.get("active", 1) else "closed",
+        "description": job.get("description", ""),
+        "required_skills": job.get("required_skills", "") or job.get("title", ""),
+        "preferred_skills": job.get("preferred_skills", ""),
+        "years_required": "",
+        "industry": job.get("department", "") or job.get("industry", ""),
+        "certifications": job.get("certifications", ""),
+        "keywords": job.get("keywords", "") or f"{job.get('title', '')} {job.get('department', '')}",
+        "salary": job.get("salary", ""),
+    }
+
+    job_context = _job_match_context(synthetic_job)
+    job_fingerprint = _fingerprint(job_context)
+    matches = []
+
+    for candidate in candidates:
+        candidate_context = _candidate_match_context(candidate)
+        candidate_fingerprint = _fingerprint(candidate_context)
+        cached_match = _get_cached_match(synthetic_job.get("id"), candidate.get("id"), job_fingerprint, candidate_fingerprint)
+        if not cached_match or cached_match.get("is_stale"):
+            continue
+
+        matches.append({
+            "candidate_id": candidate.get("id"),
+            "candidate_name": candidate.get("candidate"),
+            "current_position": candidate.get("current_position"),
+            "current_company": candidate.get("current_company"),
+            "location": candidate.get("location") or "Not found",
+            "years_experience": candidate.get("total_experience_years"),
+            "score_source": "deep-cache",
+            **cached_match,
+            "cached": True,
+            "is_cached": True,
+        })
+
+    matches.sort(key=lambda match: match.get("match_score", 0), reverse=True)
+
+    return {
+        "job": job,
+        "job_id": job.get("id"),
+        "matches": matches,
+        "total_resumes": len(candidates),
+        "strong_matches": [match for match in matches if match["match_score"] >= 70],
+        "cached_only": True,
     }
 
 

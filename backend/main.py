@@ -55,6 +55,7 @@ from .database import (
     get_user_by_id,
     get_scraped_jobs,
     get_scraped_job_matches,
+    get_scraped_job_cached_matches,
     mark_user_login,
     init_db,
     reset_user_password,
@@ -960,6 +961,14 @@ def list_scraped_job_matches(job_id: int, refresh: bool = Query(default=False)):
         return result
     finally:
         job_lock.release()
+
+
+@app.get("/api/scraped-jobs/{job_id}/cached-matches")
+def list_scraped_job_cached_matches(job_id: int):
+    result = get_scraped_job_cached_matches(job_id)
+    if not result:
+        raise HTTPException(status_code=404, detail="Scraped job not found")
+    return result
 
 
 @app.on_event("startup")

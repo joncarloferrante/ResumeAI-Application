@@ -105,6 +105,7 @@ const recruiterNavigationItems = [
   { key: "upload", label: "Upload Resume", icon: UploadIcon },
   { key: "analytics", label: "Analytics", icon: AnalyticsIcon },
   { key: "jobBoard", label: "Job Board", icon: JobBoardIcon },
+  { key: "jobMatching", label: "Job Matching", icon: JobMatchingIcon },
 ];
 
 const adminNavigationItems = [
@@ -201,6 +202,23 @@ function formatPercent(value) {
   return `${Math.round(numberValue)}%`;
 }
 
+function compareExperienceDifference(candidateYears, yearsRequiredValue) {
+  const candidateValue = Number(candidateYears);
+  const requiredValue = Number(yearsRequiredValue);
+
+  if (!Number.isFinite(candidateValue) || !Number.isFinite(requiredValue)) {
+    return "Not applicable";
+  }
+
+  const delta = candidateValue - requiredValue;
+  if (delta === 0) {
+    return "0 years";
+  }
+
+  const prefix = delta > 0 ? "+" : "";
+  return `${prefix}${delta.toFixed(1)} years`;
+}
+
 function formatFileSize(size) {
   const sizeValue = Number(size);
   if (!Number.isFinite(sizeValue) || sizeValue <= 0) {
@@ -290,6 +308,268 @@ function formatDate(value) {
 function formatSalary(value) {
   const text = String(value ?? "").trim();
   return text ? text : "N/A";
+}
+
+const TEMPORARY_MATCH_MIN_THRESHOLD = 52;
+const TEMPORARY_MATCH_MAX_RESULTS = 5;
+const TEMPORARY_MATCH_ROLE_FAMILY_PATTERNS = [
+  { family: "finance", patterns: ["finance", "accounting", "controller", "fp&a", "financial planning", "treasury", "audit"] },
+  { family: "data", patterns: ["data analyst", "business analyst", "bi", "analytics", "reporting"] },
+  { family: "engineering", patterns: ["software engineer", "developer", "backend", "frontend", "full stack", "data engineer", "devops"] },
+  { family: "recruiting", patterns: ["recruiter", "talent acquisition", "human resources", " hr "] },
+  { family: "marketing", patterns: ["marketing", "growth", "demand generation", "digital marketing"] },
+  { family: "operations", patterns: ["operations", "operational", "business operations"] },
+];
+
+const TEMPORARY_MATCH_SKILL_ALIASES = [
+  ["js", "javascript"],
+  ["ts", "typescript"],
+  ["react.js", "react"],
+  ["postgresql", "postgres"],
+  ["ms excel", "excel"],
+  ["fp&a", "financial planning and analysis"],
+  ["bi", "business intelligence"],
+  ["ta", "talent acquisition"],
+];
+
+function normalizeMatchingText(value) {
+  return String(value ?? "")
+    .toLowerCase()
+    .replace(/&/g, " and ")
+    .replace(/[^a-z0-9+\s]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function tokenizeMatchingText(value) {
+  return normalizeMatchingText(value)
+    .split(" ")
+    .map((token) => token.trim())
+    .filter(Boolean);
+}
+
+function normalizeMatchingSkillsText(value) {
+  let normalized = normalizeMatchingText(value);
+
+  for (const [alias, replacement] of TEMPORARY_MATCH_SKILL_ALIASES) {
+    const aliasPattern = new RegExp(`\\b${alias.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`, "gi");
+    normalized = normalized.replace(aliasPattern, replacement);
+  }
+
+  return normalized;
+}
+
+function getMatchingRoleFamily(value) {
+  const normalizedValue = normalizeMatchingText(value);
+  for (const entry of TEMPORARY_MATCH_ROLE_FAMILY_PATTERNS) {
+    if (entry.patterns.some((pattern) => normalizedValue.includes(pattern))) {
+      return entry.family;
+    }
+  }
+
+  return "";
+}
+
+function extractMatchingSkillTerms(candidate) {
+  const rawSkills = candidate?.normalized_skills || candidate?.skills || "";
+  return normalizeMatchingSkillsText(rawSkills)
+    .split(/[,;|/]/)
+    .flatMap((entry) => tokenizeMatchingText(entry))
+    .filter(Boolean);
+}
+
+function extractMatchingExperienceRequirement(jobText) {
+  const text = normalizeMatchingText(jobText);
+  const yearMatch = text.match(/(\d+(?:\.\d+)?)\s*\+?\s*years?/i);
+  return yearMatch ? Number(yearMatch[1]) : null;
+}
+
+function scoreTextOverlap(candidateTerms, jobTerms) {
+  if (candidateTerms.length === 0 || jobTerms.length === 0) {
+    return 0;
+  }
+
+  const candidateSet = new Set(candidateTerms);
+  const jobSet = new Set(jobTerms);
+  let overlapCount = 0;
+
+  for (const term of candidateSet) {
+    if (jobSet.has(term)) {
+      overlapCount += 1;
+    }
+  }
+
+  return Math.min(1, overlapCount / Math.max(3, Math.min(candidateSet.size, jobSet.size)));
+}
+
+function scoreTitleSimilarity(candidate, job) {
+  const candidatePosition = tokenizeMatchingText(candidate?.current_position || candidate?.current_title || "");
+  const jobTitle = tokenizeMatchingText(job?.title || "");
+  const overlap = scoreTextOverlap(candidatePosition, jobTitle);
+
+  const candidateText = normalizeMatchingText(candidate?.current_position || "");
+  const jobText = normalizeMatchingText(job?.title || "");
+  const candidateFamily = getMatchingRoleFamily(candidate?.current_position || candidate?.current_title || "");
+  const jobFamily = getMatchingRoleFamily(job?.title || "");
+
+  const seniorityTokens = [
+    ["intern", 0.1],
+    ["associate", 0.25],
+    ["specialist", 0.3],
+    ["analyst", 0.35],
+    ["senior", 0.45],
+    ["lead", 0.55],
+    ["manager", 0.6],
+    ["director", 0.7],
+    ["head", 0.75],
+    ["vp", 0.85],
+    ["vice president", 0.85],
+    ["chief", 0.95],
+    ["cfo", 0.95],
+    ["ceo", 0.95],
+  ];
+
+  let familyScore = 0;
+  if (candidateFamily && jobFamily && candidateFamily === jobFamily) {
+    familyScore = 0.78;
+  } else if (candidateFamily && jobFamily) {
+    const adjacentPairs = new Set(["finance:data", "data:finance", "finance:operations", "operations:finance", "data:engineering", "engineering:data"]);
+    if (adjacentPairs.has(`${candidateFamily}:${jobFamily}`)) {
+      familyScore = 0.35;
+    }
+  }
+
+  let seniorityScore = 0.2;
+  for (const [token, score] of seniorityTokens) {
+    if (candidateText.includes(token) && jobText.includes(token)) {
+      seniorityScore = Math.max(seniorityScore, score);
+    }
+  }
+
+  if ((candidateText.includes("director") && jobText.includes("vp")) || (candidateText.includes("vp") && jobText.includes("director"))) {
+    seniorityScore = Math.max(seniorityScore, 0.65);
+  }
+
+  return Math.max(overlap * 0.7, familyScore, seniorityScore * 0.6);
+}
+
+function scoreSkillOverlap(candidate, job) {
+  const candidateSkills = extractMatchingSkillTerms(candidate);
+  const jobText = [
+    job?.title,
+    job?.qualifications,
+    job?.responsibilities,
+    job?.description,
+    job?.department,
+    job?.workplace_type,
+    job?.company,
+  ]
+    .filter(Boolean)
+    .join(" ");
+  const jobTerms = tokenizeMatchingText(normalizeMatchingSkillsText(jobText));
+
+  const skillOverlap = scoreTextOverlap(candidateSkills, jobTerms);
+  const roleFamily = getMatchingRoleFamily(candidate?.current_position || candidate?.current_title || "");
+  const roleBoost = roleFamily && jobTerms.some((term) => term.includes(roleFamily) || roleFamily.includes(term)) ? 0.25 : 0;
+
+  return Math.max(skillOverlap, roleBoost);
+}
+
+function scoreExperienceCompatibility(candidate, job) {
+  const candidateYears = Number(candidate?.total_experience_years);
+  if (!Number.isFinite(candidateYears) || candidateYears <= 0) {
+    return 0;
+  }
+
+  const jobText = [job?.title, job?.description, job?.qualifications, job?.responsibilities].filter(Boolean).join(" ");
+  const requiredYears = extractMatchingExperienceRequirement(jobText);
+  if (!requiredYears) {
+    return candidateYears >= 1 ? 0.3 : 0;
+  }
+
+  if (candidateYears >= requiredYears) {
+    return 1;
+  }
+
+  const ratio = candidateYears / requiredYears;
+  return Math.max(0.2, Math.min(1, ratio));
+}
+
+function scoreDomainCompatibility(candidate, job) {
+  const candidateText = normalizeMatchingText([
+    candidate?.current_position,
+    candidate?.current_company,
+    candidate?.resume_summary,
+    candidate?.normalized_skills,
+    candidate?.skills,
+  ].filter(Boolean).join(" "));
+  const jobText = normalizeMatchingText([
+    job?.title,
+    job?.department,
+    job?.company,
+    job?.location,
+    job?.workplace_type,
+  ].filter(Boolean).join(" "));
+
+  const domainPairs = [
+    ["finance", ["finance", "accounting", "controller", "fp&a", "budget", "audit", "cfo"]],
+    ["data", ["data", "analytics", "analyst", "bi", "warehouse"]],
+    ["engineering", ["engineer", "engineering", "software", "developer", "devops"]],
+    ["marketing", ["marketing", "brand", "growth", "demand"]],
+    ["hr", ["hr", "recruit", "talent", "people", "people operations"]],
+    ["operations", ["operations", "ops", "supply", "logistics"]],
+  ];
+
+  for (const [domain, keywords] of domainPairs) {
+    const candidateHasDomain = keywords.some((keyword) => candidateText.includes(keyword));
+    const jobHasDomain = keywords.some((keyword) => jobText.includes(keyword));
+    if (candidateHasDomain && jobHasDomain) {
+      return 1;
+    }
+  }
+
+  return 0;
+}
+
+function scoreTemporaryCompatibility(candidate, job) {
+  const titleScore = scoreTitleSimilarity(candidate, job);
+  const skillScore = scoreSkillOverlap(candidate, job);
+  const experienceScore = scoreExperienceCompatibility(candidate, job);
+  const domainScore = scoreDomainCompatibility(candidate, job);
+
+  const weightedScore = (titleScore * 40) + (skillScore * 38) + (experienceScore * 12) + (domainScore * 10);
+  const totalScore = Math.max(0, Math.min(100, Math.round(weightedScore)));
+
+  return {
+    titleScore: Math.round(titleScore * 100),
+    skillScore: Math.round(skillScore * 100),
+    experienceScore: Math.round(experienceScore * 100),
+    domainScore: Math.round(domainScore * 100),
+    totalScore,
+  };
+}
+
+function calculateTemporaryMatchScore(candidate, job) {
+  return scoreTemporaryCompatibility(candidate, job).totalScore;
+}
+
+function getTemporaryJobMatchResults(candidateList, jobList) {
+  const resultsByJobId = new Map();
+
+  for (const job of jobList) {
+    const matches = candidateList
+      .map((candidate) => ({
+        ...candidate,
+        tempMatchScore: calculateTemporaryMatchScore(candidate, job),
+      }))
+      .filter((candidate) => candidate.tempMatchScore >= TEMPORARY_MATCH_MIN_THRESHOLD)
+      .sort((firstCandidate, secondCandidate) => secondCandidate.tempMatchScore - firstCandidate.tempMatchScore)
+      .slice(0, TEMPORARY_MATCH_MAX_RESULTS);
+
+    resultsByJobId.set(job.id, matches);
+  }
+
+  return resultsByJobId;
 }
 
 function cleanJobText(value) {
@@ -774,6 +1054,20 @@ function JobBoardIcon() {
   );
 }
 
+function JobMatchingIcon() {
+  return (
+    <AppIcon>
+      <path d="M4.5 7.5h6" />
+      <path d="M4.5 12h6" />
+      <path d="M4.5 16.5h6" />
+      <path d="M13.5 7.5h6" />
+      <path d="M13.5 16.5h6" />
+      <path d="m11.5 10.5 1.8 1.8 4.2-4.2" />
+      <path d="m11.5 15 1.8 1.8 4.2-4.2" />
+    </AppIcon>
+  );
+}
+
 function AuditIcon() {
   return (
     <AppIcon>
@@ -965,6 +1259,18 @@ function App() {
   const [jobMatchStageIndex, setJobMatchStageIndex] = useState(0);
   const [jobMatchTab, setJobMatchTab] = useState("top");
   const [selectedMatch, setSelectedMatch] = useState(null);
+  const [jobMatchingQuery, setJobMatchingQuery] = useState("");
+  const [jobMatchingStatus, setJobMatchingStatus] = useState("Active");
+  const [jobMatchingEmploymentType, setJobMatchingEmploymentType] = useState("All Types");
+  const [jobMatchingCategory, setJobMatchingCategory] = useState("All Departments");
+  const [jobMatchingSource, setJobMatchingSource] = useState("All Sources");
+  const [jobMatchingTab, setJobMatchingTab] = useState("jobsToCandidates");
+  const [selectedMatchingJobId, setSelectedMatchingJobId] = useState(null);
+  const [selectedJobMatchDetails, setSelectedJobMatchDetails] = useState(null);
+  const [selectedJobMatchTab, setSelectedJobMatchTab] = useState("overview");
+  const [cachedJobMatches, setCachedJobMatches] = useState([]);
+  const [isLoadingCachedJobMatches, setIsLoadingCachedJobMatches] = useState(false);
+  const [currentJobMatchingPage, setCurrentJobMatchingPage] = useState(1);
   const [isJobDetailsModalOpen, setIsJobDetailsModalOpen] = useState(false);
   const [isJobModalOpen, setIsJobModalOpen] = useState(false);
   const [jobForm, setJobForm] = useState(emptyJobForm);
@@ -1219,6 +1525,77 @@ function App() {
   const auditEnd = Math.min(currentAuditPage * auditLogsPerPage, visibleAuditLogs.length);
 
   const jobs = useMemo(() => jobBoard.jobs || [], [jobBoard.jobs]);
+  const visibleJobMatchingJobs = useMemo(() => {
+    const normalizedQuery = jobMatchingQuery.trim().toLowerCase();
+
+    return jobs.filter((job) => {
+      const jobDepartment = String(job.department || "").trim();
+      const jobType = String(job.job_type || job.employment_type || "").trim();
+      const jobStatus = String(job.status || "").trim().toLowerCase();
+      const activeValue = String(job.active ?? "").trim().toLowerCase();
+      const jobIsActive =
+        job.active === 1 ||
+        job.active === true ||
+        activeValue === "1" ||
+        activeValue === "true" ||
+        activeValue === "yes" ||
+        jobStatus === "open";
+      const jobSourceValue = String(job.source_slug || job.source || "").trim();
+      const matchesQuery =
+        !normalizedQuery ||
+        [job.title, job.company, job.location, job.source, job.job_number, job.job_id, job.department, job.job_type, job.employment_type, job.salary].some((value) =>
+          String(value ?? "").toLowerCase().includes(normalizedQuery),
+        );
+      const matchesStatus =
+        jobMatchingStatus === "All Statuses" ||
+        (jobMatchingStatus === "Active" ? jobIsActive : !jobIsActive);
+      const matchesType =
+        jobMatchingEmploymentType === "All Types" ||
+        jobType === jobMatchingEmploymentType;
+      const matchesCategory =
+        jobMatchingCategory === "All Departments" ||
+        jobDepartment === jobMatchingCategory;
+      const matchesSource =
+        jobMatchingSource === "All Sources" ||
+        jobSourceValue === jobMatchingSource;
+
+      return matchesQuery && matchesStatus && matchesType && matchesCategory && matchesSource;
+    });
+  }, [jobMatchingCategory, jobMatchingEmploymentType, jobMatchingQuery, jobMatchingSource, jobMatchingStatus, jobs]);
+  const jobMatchingSources = useMemo(() => {
+    const sourceValues = jobs
+      .map((job) => String(job.source_slug || job.source || "").trim())
+      .filter(Boolean);
+
+    return Array.from(new Set(sourceValues)).sort((firstSource, secondSource) =>
+      String(firstSource).localeCompare(String(secondSource), undefined, { sensitivity: "base" }),
+    );
+  }, [jobs]);
+  const jobMatchingPageSize = 10;
+  const totalJobMatchingPages = Math.max(1, Math.ceil(visibleJobMatchingJobs.length / jobMatchingPageSize));
+  const paginatedJobMatchingJobs = useMemo(() => {
+    const startIndex = (currentJobMatchingPage - 1) * jobMatchingPageSize;
+    return visibleJobMatchingJobs.slice(startIndex, startIndex + jobMatchingPageSize);
+  }, [currentJobMatchingPage, visibleJobMatchingJobs]);
+  const jobMatchingStart = visibleJobMatchingJobs.length === 0 ? 0 : (currentJobMatchingPage - 1) * jobMatchingPageSize + 1;
+  const jobMatchingEnd = Math.min(currentJobMatchingPage * jobMatchingPageSize, visibleJobMatchingJobs.length);
+  const selectedJobForMatching = useMemo(
+    () => visibleJobMatchingJobs.find((job) => Number(job.id) === Number(selectedMatchingJobId)) || visibleJobMatchingJobs[0] || null,
+    [selectedMatchingJobId, visibleJobMatchingJobs],
+  );
+  const selectedMatchingJob = selectedJobForMatching;
+  const visibleRealCandidates = useMemo(() => candidates || [], [candidates]);
+  const cachedJobMatchMap = useMemo(
+    () => new Map((cachedJobMatches || []).map((match) => [Number(match.candidate_id), match])),
+    [cachedJobMatches],
+  );
+  const temporaryJobMatchMap = useMemo(() => {
+    if (!selectedMatchingJob) {
+      return new Map();
+    }
+
+    return getTemporaryJobMatchResults(visibleRealCandidates, visibleJobMatchingJobs);
+  }, [selectedMatchingJob, visibleRealCandidates, visibleJobMatchingJobs]);
   const visibleJobs = useMemo(() => {
     const normalizedQuery = jobFilters.query.trim().toLowerCase();
     const selectedSource = normalizeSource(jobFilters.source);
@@ -1535,6 +1912,11 @@ function App() {
 
   const closeMatchDetails = () => {
     setSelectedMatch(null);
+  };
+
+  const closeJobMatchDetails = () => {
+    setSelectedJobMatchDetails(null);
+    setSelectedJobMatchTab("overview");
   };
 
   const updateAuditFilter = (key, value) => {
@@ -1865,7 +2247,7 @@ function App() {
   }, [loadAnalytics, safeActivePage, user]);
 
   useEffect(() => {
-    if (safeActivePage === "jobBoard" && user) {
+    if ((safeActivePage === "jobBoard" || safeActivePage === "jobMatching") && user) {
       loadJobs();
       if (user.role === "admin") {
         loadJobSources();
@@ -2329,6 +2711,94 @@ function App() {
       setDeletingCandidateId(null);
     }
   };
+
+  useEffect(() => {
+    setCurrentJobMatchingPage(1);
+  }, [jobMatchingCategory, jobMatchingEmploymentType, jobMatchingQuery, jobMatchingSource, jobMatchingStatus]);
+
+  useEffect(() => {
+    if (visibleJobMatchingJobs.length === 0) {
+      if (selectedMatchingJobId !== null) {
+        setSelectedMatchingJobId(null);
+      }
+      return;
+    }
+
+    const selectedJobStillVisible = visibleJobMatchingJobs.some((job) => Number(job.id) === Number(selectedMatchingJobId));
+    if (!selectedJobStillVisible) {
+      setSelectedMatchingJobId(visibleJobMatchingJobs[0].id);
+    }
+  }, [selectedMatchingJobId, visibleJobMatchingJobs]);
+
+  useEffect(() => {
+    if (currentJobMatchingPage > totalJobMatchingPages) {
+      setCurrentJobMatchingPage(totalJobMatchingPages);
+    }
+  }, [currentJobMatchingPage, totalJobMatchingPages]);
+
+  useEffect(() => {
+    if (!selectedMatchingJob) {
+      setCachedJobMatches([]);
+      setIsLoadingCachedJobMatches(false);
+      return undefined;
+    }
+
+    let isCurrent = true;
+    setIsLoadingCachedJobMatches(true);
+
+    api
+      .get(`/api/scraped-jobs/${selectedMatchingJob.id}/cached-matches`)
+      .then((response) => {
+        if (!isCurrent) {
+          return;
+        }
+        setCachedJobMatches(Array.isArray(response.data?.matches) ? response.data.matches : []);
+      })
+      .catch((error) => {
+        if (!isCurrent) {
+          return;
+        }
+        console.error(error);
+        setCachedJobMatches([]);
+      })
+      .finally(() => {
+        if (isCurrent) {
+          setIsLoadingCachedJobMatches(false);
+        }
+      });
+
+    return () => {
+      isCurrent = false;
+    };
+  }, [selectedMatchingJob?.id]);
+
+  useEffect(() => {
+    if (!import.meta.env.DEV) {
+      return undefined;
+    }
+
+    window.__jobMatchingDebug = (jobId, candidateId) => {
+      const targetJob = jobs.find((job) => String(job.id) === String(jobId));
+      const targetCandidate = candidates.find((candidate) => String(candidate.id) === String(candidateId));
+      if (!targetJob || !targetCandidate) {
+        return null;
+      }
+
+      const breakdown = scoreTemporaryCompatibility(targetCandidate, targetJob);
+      console.debug("Job Matching Debug", {
+        jobId: targetJob.id,
+        jobTitle: targetJob.title,
+        candidateId: targetCandidate.id,
+        candidateName: targetCandidate.candidate,
+        ...breakdown,
+      });
+      return breakdown;
+    };
+
+    return () => {
+      delete window.__jobMatchingDebug;
+    };
+  }, [candidates, jobs]);
 
   const renderUploadPage = () => {
     const shouldShowUploadProgress = uploadStatus !== "idle";
@@ -4168,6 +4638,667 @@ function App() {
     return fallbackText;
   };
 
+  const renderJobMatchingPage = () => {
+    const getStableJobKey = (job) => {
+      const preferredKey = String(job?.job_number || job?.job_id || job?.id || "").trim();
+      if (preferredKey) {
+        return preferredKey;
+      }
+
+      return "job";
+    };
+
+    const hashStringToNumber = (value) => {
+      const text = String(value || "");
+      let hash = 0;
+
+      for (let index = 0; index < text.length; index += 1) {
+        hash = (hash * 31 + text.charCodeAt(index)) >>> 0;
+      }
+
+      return hash;
+    };
+
+    const normalizeCandidateRole = (candidate) =>
+      candidate.current_position || candidate.current_title || candidate.current_role || "Not found";
+
+    const normalizeCandidateCompany = (candidate) => candidate.current_company || candidate.company || "Not found";
+
+    const normalizeCandidateSkills = (candidate) => {
+      const value = candidate.normalized_skills || candidate.skills;
+      if (Array.isArray(value)) {
+        return value.filter(Boolean);
+      }
+
+      return String(value || "")
+        .split(/,|\n|;/)
+        .map((entry) => entry.trim())
+        .filter(Boolean);
+    };
+
+    const getCandidateRole = (candidate) => candidate.current_position || candidate.current_title || candidate.current_role || "Not found";
+    const getCandidateLocation = (candidate) => candidate.location || candidate.current_location || candidate.current_city || "";
+    const getCandidateEducation = (candidate) => candidate.education || "";
+    const getJobExperienceYears = (job) => {
+      const sections = getStructuredJobSections(job);
+      if (sections.experienceYears) {
+        return sections.experienceYears;
+      }
+
+      const fallbackYears = extractMatchingExperienceRequirement(
+        [job?.title, job?.description, job?.qualifications, job?.responsibilities].filter(Boolean).join(" "),
+      );
+      return fallbackYears ? `${fallbackYears}+ Years` : "";
+    };
+    const parseExperienceYearsValue = (value) => {
+      const match = String(value || "").match(/(\d+(?:\.\d+)?)/);
+      return match ? Number(match[1]) : null;
+    };
+    const jobMatchNoiseWords = new Set([
+      "about",
+      "future",
+      "part",
+      "company",
+      "companies",
+      "role",
+      "position",
+      "opportunity",
+      "responsibilities",
+      "qualifications",
+      "overview",
+      "business",
+      "team",
+      "teams",
+      "work",
+      "working",
+      "candidate",
+      "candidates",
+      "years",
+      "year",
+      "experience",
+      "skills",
+      "skill",
+      "job",
+      "jobs",
+      "manage",
+      "management",
+    ]);
+    const isMeaningfulRequirementToken = (token) => token.length > 2 && !jobMatchNoiseWords.has(token);
+    const getMeaningfulJobKeywords = (job) => {
+      const rawText = [
+        job?.title,
+        job?.department,
+        job?.employment_type,
+        job?.job_type,
+        job?.description,
+        job?.qualifications,
+        job?.responsibilities,
+      ]
+        .filter(Boolean)
+        .join(" ");
+      const tokens = normalizeMatchingSkillsText(rawText)
+        .split(/[,;|/\n]/)
+        .flatMap((entry) => tokenizeMatchingText(entry))
+        .filter(isMeaningfulRequirementToken);
+      return Array.from(new Set(tokens)).slice(0, 10);
+    };
+    const getJobKeywords = (job) => {
+      return getMeaningfulJobKeywords(job);
+    };
+    const getSeniorityLevel = (title) => {
+      const value = normalizeMatchingText(title);
+      if (!value) {
+        return "Not determined";
+      }
+      if (/\bchief\b|\bcfo\b|\bceo\b|\bcoo\b|\bcro\b/.test(value)) return "Executive";
+      if (/\bvp\b|\bvice president\b|\bhead\b/.test(value)) return "Senior leadership";
+      if (/\bdirector\b/.test(value)) return "Director level";
+      if (/\bmanager\b/.test(value)) return "Manager level";
+      if (/\blead\b|\bsenior\b/.test(value)) return "Senior level";
+      if (/\bassociate\b|\bspecialist\b|\banalyst\b/.test(value)) return "Individual contributor";
+      return "Not determined";
+    };
+    const getSeniorityComparison = (jobTitle, candidateTitle) => {
+      const jobValue = normalizeMatchingText(jobTitle);
+      const candidateValue = normalizeMatchingText(candidateTitle);
+      if (!jobValue || !candidateValue) {
+        return "Not determined";
+      }
+      const order = [
+        { token: "chief", level: 6, label: "Executive" },
+        { token: "vp", level: 5, label: "Senior leadership" },
+        { token: "vice president", level: 5, label: "Senior leadership" },
+        { token: "director", level: 4, label: "Director level" },
+        { token: "manager", level: 3, label: "Manager level" },
+        { token: "senior", level: 2, label: "Senior level" },
+        { token: "lead", level: 2, label: "Senior level" },
+        { token: "associate", level: 1, label: "Individual contributor" },
+        { token: "analyst", level: 1, label: "Individual contributor" },
+      ];
+      const resolveLevel = (text) => order.find((entry) => text.includes(entry.token))?.level ?? 0;
+      const jobLevel = resolveLevel(jobValue);
+      const candidateLevel = resolveLevel(candidateValue);
+      if (!jobLevel || !candidateLevel) {
+        return "Not determined";
+      }
+      if (candidateLevel === jobLevel) return "Similar level";
+      if (candidateLevel < jobLevel) return "One or more levels below";
+      return "One or more levels above";
+    };
+    const buildJobMatchDetails = (candidate, job, cachedMatch = null) => {
+      const candidateSkills = normalizeMatchingSkillsText(normalizeCandidateSkills(candidate).join(", "))
+        .split(/[,;|/\n]/)
+        .flatMap((entry) => tokenizeMatchingText(entry))
+        .filter((term) => term.length > 1);
+      const jobKeywords = getJobKeywords(job);
+      const candidateSkillSet = new Set(candidateSkills);
+      const matchedSkills = jobKeywords.filter((term) => candidateSkillSet.has(term));
+      const missingSkills = jobKeywords.filter((term) => !candidateSkillSet.has(term));
+      const yearsRequired = getJobExperienceYears(job);
+      const candidateYears = formatYears(candidate.total_experience_years);
+      const candidateRole = getCandidateRole(candidate);
+      const roleFamily = getMatchingRoleFamily(candidateRole) || getMatchingRoleFamily(job?.title || "") || "Not determined";
+      const seniority = getSeniorityComparison(job?.title || "", candidateRole);
+      const candidateLocation = getCandidateLocation(candidate);
+      const jobLocation = job?.location || "";
+      const locationCompatible = candidateLocation
+        ? String(candidateLocation).toLowerCase() === String(jobLocation).toLowerCase() ||
+          String(jobLocation).toLowerCase().includes(String(candidateLocation).toLowerCase()) ||
+          String(candidateLocation).toLowerCase().includes(String(jobLocation).toLowerCase())
+        : null;
+      const candidateEducation = getCandidateEducation(candidate);
+      const cachedScore = Number(cachedMatch?.match_score ?? cachedMatch?.match_percentage);
+      const lightweightBreakdown = scoreTemporaryCompatibility(candidate, job);
+      const scoreBreakdown = cachedMatch
+        ? {
+            ...lightweightBreakdown,
+            totalScore: Number.isFinite(cachedScore) ? cachedScore : lightweightBreakdown.totalScore,
+          }
+        : lightweightBreakdown;
+      const whyThisMatchParts = [];
+      if (roleFamily !== "Not determined") {
+        whyThisMatchParts.push(`${roleFamily} role-family alignment`);
+      }
+      if (matchedSkills.length) {
+        whyThisMatchParts.push(`overlapping ${matchedSkills.slice(0, 3).join(", ")} skill${matchedSkills.length > 1 ? "s" : ""}`);
+      }
+      if (scoreBreakdown.experienceScore >= 60) {
+        whyThisMatchParts.push("experience is in a compatible range");
+      }
+      if (missingSkills.length) {
+        whyThisMatchParts.push(`gap: ${missingSkills.slice(0, 2).join(", ")}`);
+      }
+
+      return {
+        candidateSkills,
+        jobKeywords,
+        matchedSkills,
+        missingSkills,
+        yearsRequired: yearsRequired || "",
+        yearsRequiredValue: parseExperienceYearsValue(yearsRequired),
+        candidateYears,
+        candidateRole,
+        roleFamily,
+        seniority,
+        candidateLocation,
+        jobLocation,
+        locationCompatible,
+        candidateEducation,
+        candidateLocation,
+        whyThisMatch: whyThisMatchParts.length
+          ? whyThisMatchParts.join(", ").replace(/, gap:/, ". Main gap:")
+          : "Lightweight title, skill, and domain signals indicate a plausible match.",
+        scoreBreakdown,
+      };
+    };
+
+    const getEffectiveMatchResult = (candidate, job) => {
+      const cachedMatch = cachedJobMatchMap.get(Number(candidate.id));
+      const tempMatchScore = calculateTemporaryMatchScore(candidate, job);
+      const score = Number(cachedMatch?.match_score ?? cachedMatch?.match_percentage);
+      const effectiveScore = Number.isFinite(score) ? score : tempMatchScore;
+      const source = cachedMatch ? "deep-cache" : "lightweight-fallback";
+
+      return {
+        ...candidate,
+        tempMatchScore: effectiveScore,
+        scoreSource: source,
+        deepMatch: cachedMatch || null,
+        details: buildJobMatchDetails(candidate, job, cachedMatch),
+      };
+    };
+
+    const rankedCandidates = selectedMatchingJob
+      ? [...visibleRealCandidates]
+          .map((candidate) => getEffectiveMatchResult(candidate, selectedMatchingJob))
+          .filter((candidate) => candidate.tempMatchScore >= TEMPORARY_MATCH_MIN_THRESHOLD)
+          .sort((firstCandidate, secondCandidate) => secondCandidate.tempMatchScore - firstCandidate.tempMatchScore)
+          .slice(0, TEMPORARY_MATCH_MAX_RESULTS)
+      : [];
+
+    const tabs = [
+      { key: "jobsToCandidates", label: "Jobs → Candidates" },
+      { key: "candidatesToJobs", label: "Candidates → Jobs" },
+    ];
+    const selectedCandidate = rankedCandidates[0];
+    const selectedCandidateJobs = selectedCandidate
+      ? visibleJobMatchingJobs
+          .map((job) => ({
+            ...job,
+            tempMatchScore: calculateTemporaryMatchScore(selectedCandidate, job),
+          }))
+          .filter((job) => job.tempMatchScore >= TEMPORARY_MATCH_MIN_THRESHOLD)
+          .sort((firstJob, secondJob) => secondJob.tempMatchScore - firstJob.tempMatchScore)
+          .slice(0, TEMPORARY_MATCH_MAX_RESULTS)
+      : [];
+    const leftPanelTitle = jobMatchingTab === "jobsToCandidates" ? "Live Job Opportunities" : "Top Candidate Matches";
+    const leftPanelSubtitle =
+      jobMatchingTab === "jobsToCandidates"
+        ? "Select a job to immediately refresh the candidate matches on the right."
+        : "Select a candidate to see the most relevant live jobs on the right.";
+    const rightPanelTitle = jobMatchingTab === "jobsToCandidates" ? "Top Candidate Matches" : "Best Job Opportunities";
+
+    return (
+      <section className="page-stack job-matching-page">
+        <header className="page-header candidates-header">
+          <div>
+            <p className="section-kicker">Mock matching workspace</p>
+            <h1>Job Matching</h1>
+            <p className="subtitle">Match live job opportunities with candidates in your talent network.</p>
+          </div>
+
+          <div className="job-matching-status">
+            <span>431 Active Jobs · 8 Candidates · Matches updated 3 min ago</span>
+          </div>
+        </header>
+
+        <section className="job-matching-tabs">
+          <div className="tab-list" role="tablist" aria-label="Job matching views">
+            {tabs.map((tab) => (
+              <button
+                key={tab.key}
+                type="button"
+                className={`tab-button ${jobMatchingTab === tab.key ? "is-active" : ""}`}
+                onClick={() => setJobMatchingTab(tab.key)}
+                aria-pressed={jobMatchingTab === tab.key}
+              >
+                {tab.label}
+              </button>
+            ))}
+          </div>
+        </section>
+
+        <section className="surface-block job-matching-filter-panel">
+          <div className="job-matching-filters">
+            <label className="search-field job-search-field">
+              <span>{jobMatchingTab === "jobsToCandidates" ? "Search jobs" : "Search candidates"}</span>
+              <div className="search-input-wrap">
+                <SearchIcon />
+                <input
+                  type="search"
+                  value={jobMatchingQuery}
+                  onChange={(event) => setJobMatchingQuery(event.target.value)}
+                  placeholder="Search title, company, location, or skill area..."
+                />
+              </div>
+            </label>
+
+            <label className="audit-filter">
+              <span>Status</span>
+              <select value={jobMatchingStatus} onChange={(event) => setJobMatchingStatus(event.target.value)}>
+                <option>Active</option>
+                <option>Inactive</option>
+                <option>All Statuses</option>
+              </select>
+            </label>
+
+            <label className="audit-filter">
+              <span>Type</span>
+              <select
+                value={jobMatchingEmploymentType}
+                onChange={(event) => setJobMatchingEmploymentType(event.target.value)}
+              >
+                <option>All Types</option>
+                <option>Full-time</option>
+                <option>Contract</option>
+                <option>Part-time</option>
+              </select>
+            </label>
+
+            <label className="audit-filter">
+              <span>Department</span>
+              <select value={jobMatchingCategory} onChange={(event) => setJobMatchingCategory(event.target.value)}>
+                <option>All Departments</option>
+                {jobDepartments.map((department) => (
+                  <option key={department} value={department}>
+                    {department}
+                  </option>
+                ))}
+              </select>
+            </label>
+
+            <label className="audit-filter">
+              <span>Source</span>
+              <select value={jobMatchingSource} onChange={(event) => setJobMatchingSource(event.target.value)}>
+                <option>All Sources</option>
+                {jobMatchingSources.map((source) => (
+                  <option key={source} value={source}>
+                    {source}
+                  </option>
+                ))}
+              </select>
+            </label>
+          </div>
+        </section>
+
+        <div className="job-matching-layout">
+          <section className="surface-block">
+            <div className="surface-header">
+              <div>
+                <h2>{leftPanelTitle}</h2>
+                <p className="subtitle">{leftPanelSubtitle}</p>
+              </div>
+            </div>
+
+            {jobMatchingTab === "jobsToCandidates" ? (
+              <div className="table-shell job-matching-job-shell">
+                <table className="data-table job-matching-table">
+                  <thead>
+                    <tr>
+                      <th>Job Title</th>
+                      <th>Company</th>
+                      <th>Location</th>
+                      <th>Employment Type</th>
+                      <th>Salary</th>
+                      <th>Matches</th>
+                      <th>Status</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {visibleJobMatchingJobs.length === 0 ? (
+                      <tr>
+                        <td className="empty-state" colSpan="7">
+                          {isLoadingJobs ? "Loading jobs..." : "No jobs match your filters."}
+                        </td>
+                      </tr>
+                    ) : paginatedJobMatchingJobs.map((job) => (
+                      <tr
+                        key={job.id}
+                        className={selectedMatchingJob?.id === job.id ? "is-selected-row" : ""}
+                        onClick={() => setSelectedMatchingJobId(job.id)}
+                      >
+                        <td>
+                          <button className="job-title-button" type="button" onClick={() => setSelectedMatchingJobId(job.id)}>
+                            <strong>{job.title}</strong>
+                          </button>
+                        </td>
+                        <td>{job.company}</td>
+                        <td>{job.location}</td>
+                        <td>{formatValue(job.employment_type || job.job_type)}</td>
+                        <td>{formatSalary(job.salary)}</td>
+                        <td>{(temporaryJobMatchMap.get(job.id) || []).length}</td>
+                        <td>
+                          <span className={`status-pill ${String(job.active || job.status).toLowerCase() === "open" || job.active === 1 || job.active === true ? "status-success" : "status-pill--muted"}`}>
+                            {job.active === 1 || job.active === true || String(job.status || "").toLowerCase() === "open" ? "Active" : "Inactive"}
+                          </span>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+                <div className="table-footer">
+                  <div className="table-summary">
+                    {visibleJobMatchingJobs.length === 0
+                      ? "Showing 0 jobs"
+                      : `Showing ${jobMatchingStart}-${jobMatchingEnd} of ${visibleJobMatchingJobs.length}`}
+                  </div>
+
+                  <div className="pagination-controls">
+                    <button
+                      className="pagination-button"
+                      type="button"
+                      onClick={() => setCurrentJobMatchingPage((page) => Math.max(page - 1, 1))}
+                      disabled={currentJobMatchingPage === 1 || visibleJobMatchingJobs.length === 0}
+                      aria-label="Previous job page"
+                    >
+                      <ChevronLeftIcon />
+                    </button>
+
+                    {Array.from({ length: totalJobMatchingPages }, (_, index) => index + 1)
+                      .slice(Math.max(0, currentJobMatchingPage - 2), Math.min(totalJobMatchingPages, currentJobMatchingPage + 1))
+                      .map((pageNumber) => (
+                        <button
+                          key={pageNumber}
+                          className={`pagination-button ${pageNumber === currentJobMatchingPage ? "is-active" : ""}`}
+                          type="button"
+                          onClick={() => setCurrentJobMatchingPage(pageNumber)}
+                          aria-current={pageNumber === currentJobMatchingPage ? "page" : undefined}
+                        >
+                          {pageNumber}
+                        </button>
+                      ))}
+
+                    <button
+                      className="pagination-button"
+                      type="button"
+                      onClick={() => setCurrentJobMatchingPage((page) => Math.min(page + 1, totalJobMatchingPages))}
+                      disabled={currentJobMatchingPage === totalJobMatchingPages || visibleJobMatchingJobs.length === 0}
+                      aria-label="Next job page"
+                    >
+                      <ChevronRightIcon />
+                    </button>
+                  </div>
+                </div>
+              </div>
+            ) : (
+              <div className="match-result-list job-matching-results job-matching-candidate-list">
+                {isLoadingCandidates ? (
+                  <div className="job-match-empty-state">
+                    <strong>Loading candidates</strong>
+                    <p>Fetching the real candidate list from the existing candidates API...</p>
+                  </div>
+                ) : candidateError ? (
+                  <div className="job-match-empty-state">
+                    <strong>Could not load candidates</strong>
+                    <p>{candidateError}</p>
+                  </div>
+                ) : rankedCandidates.length === 0 ? (
+                  <div className="job-match-empty-state">
+                    <strong>No candidates available</strong>
+                    <p>The candidate database is empty right now.</p>
+                  </div>
+                ) : rankedCandidates.map((candidate) => {
+                  const scoreClass =
+                    candidate.tempMatchScore >= 90
+                      ? "match-level-strong-match"
+                      : candidate.tempMatchScore >= 85
+                        ? "match-level-good-match"
+                        : candidate.tempMatchScore >= 75
+                          ? "match-level-possible-match"
+                          : "match-level-weak-match";
+
+                  return (
+                    <button
+                      key={candidate.id}
+                      type="button"
+                      className={`match-result-card match-result-button ${selectedCandidate?.id === candidate.id ? "is-selected-row" : ""}`}
+                      onClick={() => handleViewCandidate(candidate)}
+                    >
+                      <div className="match-result-card-header">
+                        <div className="match-result-rank">{candidate.id}</div>
+                        <div className="match-result-title">
+                          <div className="match-result-title-row">
+                            <h4>{formatValue(candidate.candidate)}</h4>
+                            <span className={`match-level-pill ${scoreClass}`}>{candidate.tempMatchScore}% Match</span>
+                          </div>
+                          <p>{normalizeCandidateRole(candidate)}</p>
+                        </div>
+                        <div className="match-result-score">
+                          <strong>{candidate.tempMatchScore}%</strong>
+                          <span>match</span>
+                        </div>
+                      </div>
+                      <div className="match-result-meta">
+                        <span>{formatValue(candidate.email)}</span>
+                        <span>{normalizeCandidateCompany(candidate)}</span>
+                      </div>
+                    </button>
+                  );
+                })}
+              </div>
+            )}
+          </section>
+
+          <section className="surface-block">
+            <div className="surface-header">
+              <div>
+                <h2>{rightPanelTitle}</h2>
+                <p className="subtitle">
+                  {jobMatchingTab === "jobsToCandidates" ? (
+                    <>
+                      Best matches for <strong>{formatValue(selectedMatchingJob?.title)}</strong>
+                    </>
+                  ) : (
+                    <>
+                      Best jobs for <strong>{formatValue(selectedCandidate?.candidate)}</strong>
+                    </>
+                  )}
+                </p>
+              </div>
+            </div>
+
+            <div className="match-result-list job-matching-results">
+                {!selectedMatchingJob ? (
+                  <div className="job-match-empty-state">
+                    <strong>No job selected</strong>
+                    <p>Select a job on the left to view candidate matches.</p>
+                  </div>
+                ) : jobMatchingTab === "jobsToCandidates" ? (isLoadingCandidates ? (
+                    <div className="job-match-empty-state">
+                      <strong>Loading candidates</strong>
+                      <p>Fetching the real candidate list from the existing candidates API...</p>
+                    </div>
+                  ) : candidateError ? (
+                    <div className="job-match-empty-state">
+                      <strong>Could not load candidates</strong>
+                      <p>{candidateError}</p>
+                    </div>
+                  ) : rankedCandidates.length === 0 ? (
+                    <div className="job-match-empty-state">
+                      <strong>No strong candidate matches found.</strong>
+                      <p>No candidates passed the lightweight compatibility threshold for this job.</p>
+                    </div>
+                  ) : rankedCandidates.map((candidate) => {
+                    const scoreClass =
+                      candidate.tempMatchScore >= 90
+                        ? "match-level-strong-match"
+                        : candidate.tempMatchScore >= 85
+                          ? "match-level-good-match"
+                          : candidate.tempMatchScore >= 75
+                            ? "match-level-possible-match"
+                            : "match-level-weak-match";
+
+                    return (
+                      <article key={candidate.id} className="match-result-card">
+                        <div className="match-result-card-header">
+                          <div className="match-result-rank">{candidate.id}</div>
+                          <div className="match-result-title">
+                            <div className="match-result-title-row">
+                              <h4>{formatValue(candidate.candidate)}</h4>
+                              <span className={`match-level-pill ${scoreClass}`}>{candidate.tempMatchScore}% Match</span>
+                            </div>
+                            <p>{normalizeCandidateRole(candidate)}</p>
+                          </div>
+                          <div className="match-result-score">
+                            <strong>{candidate.tempMatchScore}%</strong>
+                            <span>match</span>
+                          </div>
+                        </div>
+
+                        <div className="match-result-meta">
+                          <span>{formatYears(candidate.total_experience_years)} experience</span>
+                          <span>{normalizeCandidateSkills(candidate).slice(0, 3).join(" · ") || "Skills not listed"}</span>
+                        </div>
+                        <div className="match-result-meta">
+                          <span>{formatValue(candidate.email)}</span>
+                          <span>{normalizeCandidateCompany(candidate)}</span>
+                        </div>
+
+                        <div className="match-result-actions">
+                          <button
+                            className="view-button"
+                            type="button"
+                            onClick={() =>
+                            setSelectedJobMatchDetails({
+                              candidate,
+                              job: selectedMatchingJob,
+                              candidateMatches: [candidate, ...rankedCandidates.filter((entry) => entry.id !== candidate.id)].slice(0, 5),
+                              details: buildJobMatchDetails(
+                                candidate,
+                                selectedMatchingJob,
+                                cachedJobMatchMap.get(Number(candidate.id)),
+                              ),
+                            })
+                          }
+                        >
+                            View Match Details
+                          </button>
+                        </div>
+                      </article>
+                    );
+                  }))
+                : selectedCandidateJobs.length === 0 ? (
+                    <div className="job-match-empty-state">
+                      <strong>No strong job matches found.</strong>
+                      <p>No jobs passed the lightweight compatibility threshold for this candidate.</p>
+                    </div>
+                  ) : selectedCandidateJobs.map((job) => {
+                  const scoreClass =
+                    job.tempMatchScore >= 90
+                      ? "match-level-strong-match"
+                        : job.tempMatchScore >= 85
+                          ? "match-level-good-match"
+                          : job.tempMatchScore >= 75
+                            ? "match-level-possible-match"
+                            : "match-level-weak-match";
+
+                    return (
+                      <article key={job.id} className="match-result-card">
+                        <div className="match-result-card-header">
+                          <div className="match-result-rank">{job.id}</div>
+                          <div className="match-result-title">
+                            <div className="match-result-title-row">
+                              <h4>{job.title}</h4>
+                            <span className={`match-level-pill ${scoreClass}`}>{job.tempMatchScore}% Match</span>
+                          </div>
+                          <p>{job.company}</p>
+                        </div>
+                        <div className="match-result-score">
+                          <strong>{job.tempMatchScore}%</strong>
+                          <span>match</span>
+                        </div>
+                      </div>
+
+                        <div className="match-result-meta">
+                          <span>{formatValue(job.location)}</span>
+                          <span>{formatValue(job.company)}</span>
+                        </div>
+
+                        <div className="match-result-actions">
+                          <button className="view-button" type="button">
+                            View Profile
+                          </button>
+                        </div>
+                      </article>
+                    );
+                  })}
+            </div>
+          </section>
+        </div>
+      </section>
+    );
+  };
+
   const renderSecurityDashboardPage = () => {
     const summary = securityDashboard.summary || emptySecurityDashboard.summary;
     const securityCards = [
@@ -4286,6 +5417,7 @@ function App() {
     upload: renderUploadPage(),
     analytics: renderAnalyticsPage(),
     jobBoard: renderJobBoardPage(),
+    jobMatching: renderJobMatchingPage(),
     securityDashboard: renderSecurityDashboardPage(),
     users: renderUsersPage(),
   };
@@ -4337,6 +5469,297 @@ function App() {
       </aside>
 
       <section className="app-content">{pageContent[safeActivePage] ?? pageContent.candidates}</section>
+
+      {selectedJobMatchDetails && (
+        <div className="modal-overlay" onClick={closeJobMatchDetails}>
+          <section
+            className="details-modal job-details-modal"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="job-match-details-title"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <header className="modal-header">
+              <div className="job-match-modal-header-copy">
+                <p className="section-kicker">Match comparison workspace</p>
+                <h2 id="job-match-details-title">{formatValue(selectedJobMatchDetails.job?.title)}</h2>
+                <p className="subtitle">
+                  {formatValue(selectedJobMatchDetails.job?.company)} · {formatValue(selectedJobMatchDetails.job?.location)} ·{" "}
+                  {formatValue(selectedJobMatchDetails.job?.employment_type || selectedJobMatchDetails.job?.job_type)} ·{" "}
+                  {formatValue(selectedJobMatchDetails.job?.last_scraped || selectedJobMatchDetails.job?.posted_date || "Recently updated")}
+                </p>
+              </div>
+
+              <div className="job-match-modal-header-actions">
+                <div className="job-match-score-hero" aria-label="Selected candidate match score">
+                  <strong>{formatPercent(selectedJobMatchDetails.details.scoreBreakdown.totalScore)}</strong>
+                  <span>{selectedJobMatchDetails.details.scoreBreakdown.totalScore >= 85 ? "Strong Match" : "Match Score"}</span>
+                </div>
+                <div className="match-result-actions">
+                  <button className="secondary-button" type="button" onClick={() => handleViewCandidate(selectedJobMatchDetails.candidate)}>
+                    View Resume
+                  </button>
+                  {(selectedJobMatchDetails.job?.url || selectedJobMatchDetails.job?.apply_url) && (
+                    <button
+                      className="secondary-button"
+                      type="button"
+                      onClick={() => window.open(selectedJobMatchDetails.job?.url || selectedJobMatchDetails.job?.apply_url, "_blank", "noopener,noreferrer")}
+                    >
+                      Open Original Job
+                    </button>
+                  )}
+                  <button className="modal-close" type="button" onClick={closeJobMatchDetails}>
+                    Close
+                  </button>
+                </div>
+              </div>
+            </header>
+
+            <div className="job-match-workspace">
+              <aside className="job-match-candidate-rail">
+                <div className="job-match-rail-header">
+                  <h3>Candidate Matches</h3>
+                  <p>Top 5 candidates for this job</p>
+                </div>
+                <div className="job-match-candidate-list">
+                  {(selectedJobMatchDetails.candidateMatches || []).map((candidate, index) => (
+                    <button
+                      key={candidate.id}
+                      type="button"
+                      className={`job-match-candidate-row ${selectedJobMatchDetails.candidate?.id === candidate.id ? "is-selected" : ""}`}
+                        onClick={() =>
+                          setSelectedJobMatchDetails({
+                            candidate,
+                            job: selectedJobMatchDetails.job,
+                            candidateMatches: selectedJobMatchDetails.candidateMatches || [],
+                            details: buildJobMatchDetails(
+                              candidate,
+                              selectedJobMatchDetails.job,
+                              cachedJobMatchMap.get(Number(candidate.id)),
+                            ),
+                          })
+                        }
+                      >
+                      <div className="job-match-candidate-rank">#{index + 1}</div>
+                      <div className="job-match-candidate-copy">
+                        <strong>{formatValue(candidate.candidate)}</strong>
+                        <span>{formatValue(candidate.current_position || candidate.current_title || candidate.current_role)}</span>
+                      </div>
+                      <div className="job-match-candidate-score">{formatPercent(candidate.tempMatchScore)}</div>
+                      <span className="job-match-candidate-action">View Details</span>
+                    </button>
+                  ))}
+                </div>
+              </aside>
+
+              <section className="job-match-detail-panel">
+                <div className="job-match-detail-header">
+                  <div>
+                    <p className="section-kicker">Selected candidate</p>
+                    <h3>{formatValue(selectedJobMatchDetails.candidate?.candidate)}</h3>
+                    <p>{formatValue(selectedJobMatchDetails.details.candidateRole)} · {formatValue(selectedJobMatchDetails.candidate?.current_company)}</p>
+                  </div>
+                  <div className="job-match-detail-score">
+                    <strong>{formatPercent(selectedJobMatchDetails.details.scoreBreakdown.totalScore)}</strong>
+                    <span>{selectedJobMatchDetails.details.scoreBreakdown.totalScore >= 85 ? "Strong Match" : "Match Score"}</span>
+                  </div>
+                </div>
+
+                <div className="job-match-tab-list" role="tablist" aria-label="Match details tabs">
+                  {[
+                    ["overview", "Match Overview"],
+                    ["facts", "Key Facts"],
+                    ["skills", "Skills Match"],
+                    ["experience", "Experience Match"],
+                    ["requirements", "Requirements"],
+                  ].map(([key, label]) => (
+                    <button
+                      key={key}
+                      type="button"
+                      className={`tab-button ${selectedJobMatchTab === key ? "is-active" : ""}`}
+                      onClick={() => setSelectedJobMatchTab(key)}
+                      aria-pressed={selectedJobMatchTab === key}
+                    >
+                      {label}
+                    </button>
+                  ))}
+                </div>
+
+                <div className="job-match-tab-panel">
+                  {selectedJobMatchTab === "overview" && (
+                    <div className="job-match-tab-grid">
+                      <section className="detail-card compact-card">
+                        <h3>Experience Summary</h3>
+                        <dl>
+                          <DetailItem label="Years required by job" value={selectedJobMatchDetails.details.yearsRequired || "Not specified"} />
+                          <DetailItem label="Candidate experience" value={formatYears(selectedJobMatchDetails.candidate?.total_experience_years)} />
+                          <DetailItem label="Difference" value={compareExperienceDifference(Number(selectedJobMatchDetails.candidate?.total_experience_years || 0), selectedJobMatchDetails.details.yearsRequiredValue)} />
+                        </dl>
+                      </section>
+
+                      <section className="detail-card compact-card">
+                        <h3>Key Highlights</h3>
+                        <ul className="match-bullet-list">
+                          <li className="is-positive">{selectedJobMatchDetails.details.roleFamily !== "Not determined" ? `${selectedJobMatchDetails.details.roleFamily} alignment` : "Role family alignment not determined"}</li>
+                          <li className={selectedJobMatchDetails.details.matchedSkills.length ? "is-positive" : "is-warning"}>{selectedJobMatchDetails.details.matchedSkills.length ? `${selectedJobMatchDetails.details.matchedSkills.slice(0, 3).join(", ")} matched skills` : "Few direct skill matches identified"}</li>
+                          <li className={selectedJobMatchDetails.details.yearsRequiredValue !== null && Number(selectedJobMatchDetails.candidate?.total_experience_years || 0) >= selectedJobMatchDetails.details.yearsRequiredValue ? "is-positive" : "is-warning"}>
+                            {selectedJobMatchDetails.details.yearsRequiredValue !== null ? "Candidate meets or exceeds the stated experience requirement" : "Experience requirement not specified"}
+                          </li>
+                          <li className={selectedJobMatchDetails.details.missingSkills.length ? "is-warning" : "is-positive"}>
+                            {selectedJobMatchDetails.details.missingSkills.length ? `Main gap: ${selectedJobMatchDetails.details.missingSkills.slice(0, 2).join(", ")}` : "No obvious missing core skills"}
+                          </li>
+                        </ul>
+                        <p className="job-match-why">{selectedJobMatchDetails.details.whyThisMatch}</p>
+                      </section>
+
+                      <section className="detail-card compact-card">
+                        <h3>Match Breakdown</h3>
+                        <div className="score-breakdown-list">
+                          {[
+                            ["Title", selectedJobMatchDetails.details.scoreBreakdown.titleScore],
+                            ["Skills", selectedJobMatchDetails.details.scoreBreakdown.skillScore],
+                            ["Experience", selectedJobMatchDetails.details.scoreBreakdown.experienceScore],
+                            ["Domain", selectedJobMatchDetails.details.scoreBreakdown.domainScore],
+                            ["Overall", selectedJobMatchDetails.details.scoreBreakdown.totalScore],
+                          ].map(([label, score]) => (
+                            <div className="score-breakdown-item" key={label}>
+                              <div>
+                                <span>{label}</span>
+                                <strong>{formatPercent(score)}</strong>
+                              </div>
+                              <div className="score-breakdown-bar">
+                                <span style={{ width: `${score}%` }} />
+                              </div>
+                            </div>
+                          ))}
+                        </div>
+                      </section>
+                    </div>
+                  )}
+
+                  {selectedJobMatchTab === "facts" && (
+                    <section className="detail-card compact-card">
+                      <h3>Key Facts at a Glance</h3>
+                      <dl className="details-two-column">
+                        <DetailItem label="Current title" value={selectedJobMatchDetails.details.candidateRole} />
+                        <DetailItem label="Current company" value={selectedJobMatchDetails.candidate?.current_company} />
+                        <DetailItem label="Total experience" value={formatYears(selectedJobMatchDetails.candidate?.total_experience_years)} />
+                        <DetailItem label="Email" value={selectedJobMatchDetails.candidate?.email} />
+                        {selectedJobMatchDetails.details.candidateEducation ? <DetailItem label="Education" value={selectedJobMatchDetails.details.candidateEducation} /> : null}
+                        {selectedJobMatchDetails.details.candidateLocation ? <DetailItem label="Location" value={selectedJobMatchDetails.details.candidateLocation} /> : null}
+                        {selectedJobMatchDetails.candidate?.salary ? <DetailItem label="Salary" value={selectedJobMatchDetails.candidate.salary} /> : null}
+                      </dl>
+                    </section>
+                  )}
+
+                  {selectedJobMatchTab === "skills" && (
+                    <div className="job-match-tab-grid">
+                      <section className="detail-card compact-card">
+                        <h3>Matched Skills</h3>
+                        <div className="skill-tag-list">
+                          {selectedJobMatchDetails.details.matchedSkills.length ? (
+                            selectedJobMatchDetails.details.matchedSkills.slice(0, 12).map((skill) => (
+                              <span className="skill-tag is-positive" key={skill}>
+                                {skill}
+                              </span>
+                            ))
+                          ) : (
+                            <span className="skill-tag is-muted">None identified</span>
+                          )}
+                        </div>
+                      </section>
+                      <section className="detail-card compact-card">
+                        <h3>Partial / Related Skills</h3>
+                        <div className="skill-tag-list">
+                          {selectedJobMatchDetails.details.jobKeywords.filter((keyword) => !selectedJobMatchDetails.details.matchedSkills.includes(keyword)).slice(0, 10).map((keyword) => (
+                            <span className="skill-tag is-neutral" key={keyword}>
+                              {keyword}
+                            </span>
+                          ))}
+                          {!selectedJobMatchDetails.details.jobKeywords.filter((keyword) => !selectedJobMatchDetails.details.matchedSkills.includes(keyword)).length && (
+                            <span className="skill-tag is-muted">None identified</span>
+                          )}
+                        </div>
+                      </section>
+                      <section className="detail-card compact-card">
+                        <h3>Missing Important Skills</h3>
+                        <div className="skill-tag-list">
+                          {selectedJobMatchDetails.details.missingSkills.length ? (
+                            selectedJobMatchDetails.details.missingSkills.slice(0, 12).map((skill) => (
+                              <span className="skill-tag is-missing" key={skill}>
+                                {skill}
+                              </span>
+                            ))
+                          ) : (
+                            <span className="skill-tag is-muted">None identified</span>
+                          )}
+                        </div>
+                      </section>
+                    </div>
+                  )}
+
+                  {selectedJobMatchTab === "experience" && (
+                    <div className="job-match-tab-grid">
+                      <section className="detail-card compact-card">
+                        <h3>Overall Experience Comparison</h3>
+                        <dl className="details-two-column">
+                          <DetailItem label="Required years" value={selectedJobMatchDetails.details.yearsRequired || "Not specified"} />
+                          <DetailItem label="Candidate years" value={formatYears(selectedJobMatchDetails.candidate?.total_experience_years)} />
+                          <DetailItem label="Difference" value={compareExperienceDifference(Number(selectedJobMatchDetails.candidate?.total_experience_years || 0), selectedJobMatchDetails.details.yearsRequiredValue)} />
+                        </dl>
+                      </section>
+                      <section className="detail-card compact-card">
+                        <h3>Experience by Area</h3>
+                        <div className="match-result-skills">
+                          {["Finance", "FP&A", "Accounting", "Leadership", "Data Engineering", "SQL", "Cloud", "Recruiting", "Operations"].map((area) => {
+                            const areaText = normalizeMatchingText([
+                              selectedJobMatchDetails.job?.title,
+                              selectedJobMatchDetails.job?.description,
+                              selectedJobMatchDetails.job?.qualifications,
+                              selectedJobMatchDetails.candidate?.resume_summary,
+                              selectedJobMatchDetails.candidate?.normalized_skills,
+                              selectedJobMatchDetails.candidate?.skills,
+                            ].filter(Boolean).join(" "));
+                            const token = normalizeMatchingText(area);
+                            const level = areaText.includes(token) ? "Strong evidence" : selectedJobMatchDetails.details.whyThisMatch.toLowerCase().includes(token) ? "Some evidence" : "Not found";
+                            return (
+                              <div className="match-result-field" key={area}>
+                                <span>{area}</span>
+                                <strong>{level}</strong>
+                              </div>
+                            );
+                          })}
+                        </div>
+                      </section>
+                    </div>
+                  )}
+
+                  {selectedJobMatchTab === "requirements" && (
+                    <section className="detail-card compact-card">
+                      <h3>Requirements</h3>
+                      <ul className="match-bullet-list">
+                        {selectedJobMatchDetails.details.jobKeywords.length ? (
+                          selectedJobMatchDetails.details.jobKeywords.slice(0, 12).map((keyword) => {
+                            const matched = selectedJobMatchDetails.details.matchedSkills.includes(keyword);
+                            const isPartial = !matched && normalizeMatchingText(selectedJobMatchDetails.details.candidateRole).includes(keyword);
+                            return (
+                              <li key={keyword} className={matched ? "is-positive" : isPartial ? "is-warning" : "is-missing"}>
+                                {keyword} — {matched ? "Matched" : isPartial ? "Partial" : "Not Found"}
+                              </li>
+                            );
+                          })
+                        ) : (
+                          <li className="is-muted">No meaningful requirements could be extracted.</li>
+                        )}
+                      </ul>
+                    </section>
+                  )}
+                </div>
+              </section>
+            </div>
+          </section>
+        </div>
+      )}
 
       {selectedCandidate && (
         <div className="modal-overlay" onClick={closeCandidateDetails}>

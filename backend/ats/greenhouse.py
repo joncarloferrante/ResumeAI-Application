@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import re
 from datetime import datetime, timezone
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 import requests
 
@@ -29,7 +29,8 @@ def normalize_careers_url(careers_url: str) -> str:
 
     path = parsed.path.strip("/")
     parts = [part for part in path.split("/") if part]
-    company_slug = parts[0] if parts else parsed.netloc.split(".")[0]
+    query_params = parse_qs(parsed.query)
+    company_slug = query_params.get("for", [parts[0] if parts else parsed.netloc.split(".")[0]])[0]
     if "boards-api.greenhouse.io" in host:
         return raw_url
 
@@ -49,6 +50,9 @@ def extract_company_slug(careers_url: str) -> str:
     parsed = urlparse(careers_url.strip())
     path = parsed.path.strip("/")
     parts = [part for part in path.split("/") if part]
+    query_params = parse_qs(parsed.query)
+    if query_params.get("for"):
+        return query_params["for"][0]
     host = parsed.netloc.lower()
     if "boards-api.greenhouse.io" in host and parts:
         return parts[-1]
